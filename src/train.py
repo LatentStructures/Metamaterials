@@ -1,0 +1,217 @@
+"""Training loop for the baseline DDPM (ROADMAP section 4.5, section 5).
+
+Reproducible from train_baseline.yaml + model_baseline.yaml + a fixed seed.
+Supports bf16 autocast, EMA, checkpoint/resume, cosine LR, wandb/tensorboard,
+periodic DDIM sampling with rendered voxel-grid images, and an ``--overfit``
+mode for the 10-sample architecture test (section 4.2). No hyperparameters are
+hardcoded here.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch import optim
+from torch.utils.data import DataLoader
+
+from src.config import load_yaml, set_seed, REPO_ROOT
+from src.data.dataset import MetamaterialDataset
+from src.models.diffusion import build_diffusion
+from src.models.unet3d import UNet3D
+
+LOG = logging.getLogger(__name__)
+
+
+class EMA:
+    """Exponential moving average of the model weights (decay 0.9999)."""
+
+    def __init__(self, model: torch.nn.Module, decay: float):
+        self.decay = decay
+        self.shadow = {k: v.detach().clone().float() for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        for k, v in model.state_dict().items():
+            self.shadow[k].mul_(self.decay).add_(v.detach().float(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply(self, model: torch.nn.Module) -> None:
+        model.load_state_dict({k: v.float() for k, v in self.shadow.items()}, strict=True)
+
+
+def render_voxel_projection(vox: torch.Tensor) -> np.ndarray:
+    """Orthographic max-intensity projections -> (3, 32, 32) CHW uint8 image."""
+    v = vox.detach().float().cpu()
+    if v.ndim == 5:
+        v = v[0, 0]
+    elif v.ndim == 4:
+        v = v[0]
+    v = (v > 0.5).float()
+    xs = [np.asarray(v.max(dim=k).values) for k in (0, 1, 2)]
+    return (np.stack(xs, axis=0) * 255.0).astype(np.uint8)
+
+
+def _make_logger(backend: str, project: str, run_dir: Path, config: dict):
+    """Return (log_scalar, log_image) with wandb->tensorboard fallback."""
+    if backend == "wandb":
+        try:
+            import wandb
+            wandb.init(project=project, config=config, dir=str(run_dir.parent))
+            return (lambda tag, val, step: wandb.log({tag: val}, step=step),
+                    lambda tag, img, step: wandb.log({tag: wandb.Image(img)}, step=step))
+        except Exception as e:
+            LOG.warning("wandb unavailable (%s); falling back to tensorboard", e)
+    from torch.utils.tensorboard import SummaryWriter
+    tb = SummaryWriter(log_dir=str(run_dir))
+    return (tb.add_scalar, tb.add_image)
+
+
+def _load_physics(lamb: float, device: torch.device):
+    """Option B connectivity proxy (Gowtham's module). Disabled when lambda_1 == 0."""
+    if lamb <= 0.0:
+        return lambda *_: torch.tensor(0.0, device=device)
+    try:
+        from src.losses.physics_loss import connectivity_proxy_loss
+    except ImportError:
+        raise SystemExit(
+            f"physics_loss.lambda_1 = {lamb} > 0 requires "
+            "src/losses/physics_loss.py (Option B, Week 7) and cannot run without it."
+        )
+    return connectivity_proxy_loss
+
+
+def _parse():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--train-config", default=str(REPO_ROOT / "configs/train_baseline.yaml"))
+    ap.add_argument("--model-config", default=str(REPO_ROOT / "configs/model_baseline.yaml"))
+    ap.add_argument("--run-dir", default=None)
+    ap.add_argument("--overfit", type=int, default=0,
+                    help="architecture test: train on N samples only (section 4.2)")
+    ap.add_argument("--max-iterations", type=int, default=0, help="0 = run to completion")
+    ap.add_argument("--resume-from", default=None)
+    return ap.parse_args()
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = _parse()
+
+    tcfg = load_yaml(args.train_config)
+    mcfg = load_yaml(args.model_config)
+    set_seed(int(tcfg["seed"]))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    mp = tcfg.get("mixed_precision", "bf16")
+
+    dataset = MetamaterialDataset(REPO_ROOT / tcfg["data"]["hdf5"])
+    if args.overfit:
+        dataset.voxels = dataset.voxels[:args.overfit]
+        dataset.cond = dataset.cond[:args.overfit]
+        bs = min(int(tcfg["batch_size"]), args.overfit)
+    else:
+        bs = int(tcfg["batch_size"])
+    loader = DataLoader(dataset, batch_size=bs, shuffle=True, drop_last=False,
+                        num_workers=0, pin_memory=device.type == "cuda")
+
+    model = UNet3D.from_config(mcfg["unet3d"]).to(device)
+    diffusion = build_diffusion(mcfg["diffusion"], device)
+    n_params = sum(p.numel() for p in model.parameters())
+    LOG.info("device=%s param_count=%.2fM samples=%d", device, n_params / 1e6, len(dataset))
+
+    iters_per_epoch = max(1, len(loader))
+    if args.max_iterations:
+        max_iters = args.max_iterations
+    elif args.overfit:
+        max_iters = args.overfit * 50
+    else:
+        max_iters = iters_per_epoch * int(tcfg.get("epochs", 1000))
+    opt = optim.AdamW(model.parameters(), lr=float(tcfg["optimizer"]["lr"]))
+    if tcfg["optimizer"].get("lr_schedule") == "cosine":
+        sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, max_iters))
+    else:
+        sched = None
+
+    ema_cfg = tcfg.get("ema", {})
+    ema = EMA(model, float(ema_cfg["decay"])) if ema_cfg.get("enabled", False) else None
+
+    physics_cfg = tcfg.get("physics_loss", {})
+    physics = _load_physics(float(physics_cfg.get("lambda_1", 0.0)), device)
+    lamb = float(physics_cfg.get("lambda_1", 0.0))
+    warmup_iters = int(float(physics_cfg.get("warmup_fraction", 0.0)) * max_iters)
+
+    run_dir = Path(args.run_dir) if args.run_dir else REPO_ROOT / "runs" / time.strftime("%Y%m%d-%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_scalar, log_image = _make_logger(
+        tcfg["logging"]["backend"], tcfg["logging"]["project"], run_dir, dict(mcfg))
+    ckpt_every = int(tcfg.get("checkpoint_every", 1000))
+    sample_every = int(tcfg["logging"].get("sample_interval", 5000))
+
+    autocast = torch.autocast(device_type=device.type,
+                              dtype=torch.bfloat16) if mp == "bf16" else torch.autocast(
+        device_type=device.type, enabled=False)
+
+    global_step = 0
+    if args.resume_from:
+        ck = torch.load(args.resume_from, map_location=device)
+        model.load_state_dict(ck["model"])
+        if ema:
+            ema_shadow = ck.get("ema")
+            if ema_shadow is not None:
+                ema.shadow = {k: torch.tensor(v) for k, v in ema_shadow.items()}
+        opt.load_state_dict(ck["optim"])
+        global_step = int(ck.get("iter", 0))
+        LOG.info("resumed from %s (iter %d)", args.resume_from, global_step)
+
+    t_start = time.time()
+    model.train()
+    cond_test = torch.as_tensor(dataset.cond[:4].copy()).to(device)
+    while global_step < max_iters:
+        for x, c in loader:
+            if global_step >= max_iters:
+                break
+            x, c = x.to(device), c.to(device)
+            opt.zero_grad()
+            with autocast:
+                loss = diffusion.p_losses(model, x, c)
+                if lamb > 0.0:
+                    lam = lamb * min(1.0, global_step / max(1, warmup_iters))
+                    loss = loss + lam * physics(x, c, torch.zeros_like(c[:, :1]))
+            loss.backward()
+            opt.step()
+            if sched is not None:
+                sched.step()
+            if ema is not None:
+                ema.update(model)
+            global_step += 1
+
+            if global_step % 50 == 0 or global_step == 1:
+                lr = opt.param_groups[0]["lr"]
+                LOG.info("iter %d/%d loss %.4f lr %.2e elapsed %.1fs",
+                         global_step, max_iters, loss.item(), lr, time.time() - t_start)
+                log_scalar("train/loss", loss.item(), global_step)
+
+            if global_step % ckpt_every == 0:
+                torch.save({"model": model.state_dict(), "optim": opt.state_dict(),
+                            "ema": {k: v for k, v in ema.shadow.items()} if ema else None,
+                            "iter": global_step}, run_dir / "ckpt.pt")
+
+            if global_step % sample_every == 0:
+                if ema is not None:
+                    ema.apply(model)
+                model.eval()
+                with torch.no_grad():
+                    gen = diffusion.sample_ddim(model, cond_test,
+                                                (4, 1, 32, 32, 32), steps=50, seed=0)
+                img = render_voxel_projection(gen)
+                log_image("eval/samples", img, global_step)
+                model.train()
+
+    LOG.info("training done at iter %d in %.1fs", global_step, time.time() - t_start)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,8 +1,8 @@
 # Week-1 smoke test: hello-world FEniCSx homogenization on a single solid cube.
-# ROADMAP.md Section 1 "Definition of done": clone → create env → this script must
+# ROADMAP.md Section 1 "Definition of done": clone -> create env -> this script must
 # generate one voxel cube, homogenize it, and print its stiffness tensor.
 #
-# This is a TRIVIAL sanity check of the FEA stack only — the full periodic-BC
+# This is a TRIVIAL sanity check of the FEA stack only -- the full periodic-BC
 # homogenization (PBC/MPC + 6 load cases + benchmark validation) is the Phase-1
 # milestone in src/fea/ (Section 3.3). A fully solid, isotropic cube under a prescribed
 # affine axial strain must return C1111 within tolerance of the closed form:
@@ -24,14 +24,14 @@ TOL = 1e-4    # relative tolerance vs closed form (affine field is exact; this i
 
 def main() -> None:
     # 1) Generate one voxel cube (the Phase 1 representation): an all-solid
-    #    binary occupancy grid (16³ here for speed; the dataset uses 32³).
+    #    binary occupancy grid (16^3 here for speed; the dataset uses 32^3).
     res = 16
     voxels = np.ones((res, res, res), dtype=np.uint8)
     print(f"voxel grid: shape={voxels.shape} dtype={voxels.dtype} "
           f"solid fraction={voxels.mean():.2f}")
 
-    # 2) Substitute a solid unit cube for the FEniCSx solve — the real
-    #    voxel→mesh pipeline is a Phase 1 deliverable (src/geometry).
+    # 2) Substitute a solid unit cube for the FEniCSx solve -- the real
+    #    voxel->mesh pipeline is a Phase 1 deliverable (src/geometry).
     nx = 4
     msh = mesh.create_unit_cube(MPI.COMM_WORLD, nx, nx, nx,
                                 mesh.CellType.hexahedron)
@@ -70,7 +70,7 @@ def main() -> None:
     LinearProblem(a, L, u=uh, bcs=[bc], petsc_options={"pc_type": "lu"},
                       petsc_options_prefix="smoke_").solve()
 
-    # 4) Homogenize via the strain-energy formula: C1111 = 2·W / ε_xx² (Phase 1, Section 3.3).
+    # 4) Homogenize via the strain-energy formula: C1111 = 2*W / ε_xx^2 (Phase 1, Section 3.3).
     W = fem.assemble_scalar(
         fem.form(0.5 * ufl.inner(sigma(uh), ufl.sym(ufl.grad(uh))) * ufl.dx))
     c1111 = 2.0 * W / eps_xx**2

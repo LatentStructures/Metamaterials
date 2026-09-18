@@ -13,6 +13,7 @@ ema:
   decay: 0.9999
 batch_size: 32                                   # 32³ fits on 24 GB; reduce on smaller GPUs
 mixed_precision: bf16                            # bf16 preferred where supported
+epochs: 1000                                     # full-baseline budget; overridden by --overfit
 checkpoint_every: 1000
 physics_loss:                                    # Option B only (Phase 2, Section 4.4); Option A is a contingency
   option: B
