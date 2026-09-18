@@ -1,0 +1,38 @@
+# Environment for the metamaterial diffusion baseline (ROADMAP.md Section 1).
+# Everything is installed from conda-forge EXCEPT torch, which is deliberately
+# not listed here: CUDA builds are machine-specific — see the README for the
+# separate `pip install` step. Python 3.11 because fenics-dolfinx 0.11 supports
+# cp311/cp312 and 3.10 was dropped upstream (ROADMAP Section 1 pins 3.10/3.11).
+name: metamaterials
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+
+  # FEA (dolfinx conda-forge build is the only reliable install path)
+  - fenics-dolfinx=0.11.*
+
+  # Numerics
+  - numpy>=1.26
+  - scipy>=1.11
+  - h5py>=3.10
+
+  # Geometry / meshing / visualization
+  - scikit-image>=0.22
+  - meshio>=5.3
+  - gmsh>=4.11           # conda build is CLI-only (no `import gmsh`); meshio drives it
+  - pyvista>=0.43
+  - trimesh>=4.0
+
+  # Experiment tracking / reproducibility
+  - pyyaml>=6.0
+  - wandb>=0.16
+  - tensorboard>=2.14
+  - tqdm>=4.66
+
+  # Testing
+  - pytest>=7.4
+
+  # Plotting / notebooks
+  - matplotlib>=3.8

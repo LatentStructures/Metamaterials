@@ -1,0 +1,26 @@
+# Phase 2 training run config (ROADMAP.md Phase 2, Section 4.5; Section 5).
+# No hyperparameters are hardcoded in scripts — this file is the source.
+seed: 0
+data:
+  hdf5: data/dataset_train.h5
+  conditioning_order: [E, relative_density, nu]   # must match manifest + HDF5 /conditioning_vector (Phase 1, Section 3.4)
+optimizer:
+  name: adamw
+  lr: 1e-4
+  lr_schedule: cosine                            # cosine decay (Phase 2, Section 4.5)
+ema:
+  enabled: true
+  decay: 0.9999
+batch_size: 32                                   # 32³ fits on 24 GB; reduce on smaller GPUs
+mixed_precision: bf16                            # bf16 preferred where supported
+checkpoint_every: 1000
+physics_loss:                                    # Option B only (Phase 2, Section 4.4); Option A is a contingency
+  option: B
+  lambda_1: 0.0
+  warmup_fraction: 0.2                           # λ₁ warmed from 0 over first 20% of training
+  ablation: {lambda_1: 0.05, tag: abl_physics}   # run the ablation pair (Phase 2, Section 4.4)
+logging:
+  backend: wandb                                 # or tensorboard
+  project: metamaterials-baseline
+  eval_interval: 1000                            # loss curves AND rendered voxel grids (Phase 2, Section 4.5)
+  sample_interval: 5000

@@ -1,0 +1,24 @@
+# Phase 1 dataset generation config (see ROADMAP.md Phase 1).
+# Every run must be reproducible from this file alone with a fixed seed (Section 5).
+seed: 0
+resolution: 32                                   # fixed 32³ for the whole baseline
+families:                                        # exactly these three (Phase 1, Section 3.1), no others
+  - cubic_strut
+  - octet_truss
+  - gyroid
+relative_density_range: [0.1, 0.6]               # target band for sampling (Phase 1, Section 3.1)
+voxel_dtype: uint8                               # matches HDF5 /voxels schema (Phase 1, Section 3.4)
+splits:
+  train: 0.8
+  val: 0.1
+  test: 0.1                                      # stratified by family + density bucket (Phase 1, Section 3.4)
+hdf5: data/dataset_{split}.h5                    # one file per split, chunked (Phase 1, Section 3.4)
+conditioning_order: [E, relative_density, nu]    # must match /conditioning_vector + model input (Phase 1, Section 3.4)
+manifest: data/manifest.parquet                  # keep in git; version the HDF5 binaries with DVC (Phase 1, Section 3.4)
+checkpoint_every: 100                            # resume from cell K, never restart (Phase 1, Section 3.3)
+homogenization:
+  method: fea
+  validation_tolerance: 0.05                     # ≥3 closed-form benchmarks ≤5% before full run (Phase 1, Section 3.3)
+augmentation:
+  enabled: true
+  symmetries: proper_rotations_only              # up to 24; rotate the stiffness tensor too (Phase 1, Section 3.4)

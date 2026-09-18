@@ -1,0 +1,33 @@
+# --- Dataset binaries (HDF5, npz). Keep Parquet/CSV manifests in git (§3.4) ---
+data/*
+!data/*.csv
+!data/*.parquet
+!data/README*
+!data/.gitkeep
+
+# --- Local conda/micromamba env & cache (repo-local, see README) ---
+.mamba/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# --- Training artifacts ---
+runs/
+checkpoints/
+*.pt
+*.ckpt
+wandb/
+
+# --- DVC internals ---
+.dvc/
+.dvc/cache/
+
+# --- OS ---
+.DS_Store
