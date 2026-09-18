@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import optim
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from src.config import load_yaml, set_seed, REPO_ROOT
@@ -176,10 +177,19 @@ def main() -> None:
             x, c = x.to(device), c.to(device)
             opt.zero_grad()
             with autocast:
-                loss = diffusion.p_losses(model, x, c)
+                # Inline DDPM step so the physics term can be attached to the
+                # denoised x0 prediction (ROADMAP 4.4: proxy sees the soft,
+                # pre-threshold occupancy), not to the noise-free data sample.
+                b = x.shape[0]
+                tt = torch.randint(0, diffusion.T, (b,), device=device)
+                noise = torch.randn_like(x)
+                xt = diffusion.q_sample(x, tt, noise)
+                pred = model(xt, tt, c)
+                loss = F.mse_loss(pred, noise)
                 if lamb > 0.0:
                     lam = lamb * min(1.0, global_step / max(1, warmup_iters))
-                    loss = loss + lam * physics(x, c, torch.zeros_like(c[:, :1]))
+                    x0 = diffusion.predict_denoised(xt, tt, pred).clamp(0.0, 1.0)
+                    loss = loss + lam * physics(x0, c, tt.to(c.dtype).unsqueeze(-1))
             loss.backward()
             opt.step()
             if sched is not None:

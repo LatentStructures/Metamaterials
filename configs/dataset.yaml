@@ -23,6 +23,8 @@ checkpoint_every: 100                            # resume from cell K, never res
 homogenization:
   method: fea
   validation_tolerance: 0.05                     # ≥3 closed-form benchmarks ≤5% before full run (Phase 1, Section 3.3)
+  void_scale: 1.0e-6                             # E_void = scale * E_base, nu_void = nu_base (Ersatz material)
+fea_retries: 3                                   # resample attempts per cell before skipping it
 augmentation:
   enabled: true
   symmetries: proper_rotations_only              # up to 24; rotate the stiffness tensor too (Phase 1, Section 3.4)

@@ -20,15 +20,26 @@ import meshio
 import numpy as np
 
 # 6-tet tessellation of a unit cube as (corner-id, corner-id, ...) with corners
-# 0..7 = bit pattern (x + 2y + 4z); every tet has positive orientation.
+# 0..7 = bit pattern (x + 2y + 4z); every tet has positive orientation (the
+# orientation fix in ``voxels_to_struct_tetra`` flips any negatively oriented
+# tet without changing its faces).
+#
+# This is the *face-conforming, translation-invariant* Kuhn triangulation of the
+# cube: each cube face is split by exactly one diagonal (x1: 1-7, x0: 0-6,
+# y1: 2-7, y0: 0-5, z1: 4-7, z0: 0-3), all sharing the space diagonal (0,7).
+# Because every voxel uses the identical table, adjacent voxels produce matching
+# diagonals on their shared faces, so the global mesh is conforming.  (The
+# naive 6-tet split of the cube is *not* face-conforming and leaves holes /
+# overlaps at y-faces -- it feeds wrong physics to the homogenizer, which only
+# shows up on two-phase cells.)
 _TET_TABLE = np.array(
     [
         [0, 1, 3, 7],
         [0, 2, 3, 7],
-        [0, 1, 5, 7],
-        [0, 5, 6, 7],
         [0, 2, 6, 7],
         [0, 4, 6, 7],
+        [0, 4, 5, 7],
+        [0, 1, 5, 7],
     ],
     dtype=np.int64,
 )

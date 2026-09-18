@@ -47,6 +47,17 @@ class GaussianDiffusion:
         return torch.sqrt(ab[:, None, None, None, None]) * x0 + \
             torch.sqrt(1.0 - ab[:, None, None, None, None]) * noise
 
+    def predict_denoised(self, xt: torch.Tensor, t: torch.Tensor,
+                         eps_pred: torch.Tensor, clamp: tuple[float, float] | None = None
+                         ) -> torch.Tensor:
+        """Invert q_sample: x0 = (x_t - sqrt(1 - alpha_bar_t) eps) / sqrt(alpha_bar_t)."""
+        ab = self.schedule.alpha_bar.to(xt.device)[t]
+        x0 = (xt - torch.sqrt(1.0 - ab)[:, None, None, None, None] * eps_pred) / \
+            torch.sqrt(ab)[:, None, None, None, None]
+        if clamp is not None:
+            x0 = x0.clamp(*clamp)
+        return x0
+
     def p_losses(self, model: nn.Module, x0: torch.Tensor, cond: torch.Tensor,
                  rng: torch.Generator | None = None) -> torch.Tensor:
         """Random timestep eps-MSE (L_simple) -- the only training loss."""
