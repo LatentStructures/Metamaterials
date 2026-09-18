@@ -31,6 +31,10 @@ dependencies:
   - tensorboard>=2.14
   - tqdm>=4.66
 
+  # Data manifests (Parquet/CSV)
+  - pandas>=2.2
+  - pyarrow>=17.0
+
   # Testing
   - pytest>=7.4
 

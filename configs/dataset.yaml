@@ -2,6 +2,10 @@
 # Every run must be reproducible from this file alone with a fixed seed (Section 5).
 seed: 0
 resolution: 32                                   # fixed 32³ for the whole baseline
+num_cells: 2000                                  # cells per family (pre-augmentation total = num_cells * 3)
+base_material:                                   # solid-phase props; E is a scale factor for homogenized C (Phase 1, Section 3.1)
+  E: 1.0
+  nu: 0.3
 families:                                        # exactly these three (Phase 1, Section 3.1), no others
   - cubic_strut
   - octet_truss
