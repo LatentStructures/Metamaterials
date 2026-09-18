@@ -1,0 +1,16 @@
+# FEA-verified evaluation + synthesizability filter (ROADMAP 4.6, section 3.5).
+# Default targets for the report:
+samples_dir: outputs/samples        # outputs of `python -m src.sample`
+out_dir: outputs/evaluate
+
+resolution: 32                      # locked grid resolution for re-homogenization
+
+base_material:                      # same base material as the dataset (Phase 1)
+  E: 1.0
+  nu: 0.3
+void_scale: 1.0e-6
+
+# Synthesizability filter (own core; `src.validation` overrides when present)
+min_wall_voxels: 2                  # opening size for the 1-voxel-thin-wall check
+max_thin_fraction: 0.05             # reject if opening removes more solid than this
+max_overhang_fraction: 1.0          # approximate AM overhang heuristic (baseline: off)
