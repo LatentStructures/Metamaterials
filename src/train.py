@@ -19,12 +19,18 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from src.config import load_yaml, set_seed, REPO_ROOT
-from src.data.dataset import MetamaterialDataset
+from src.config import REPO_ROOT, load_yaml, set_seed
+from src.data.dataset import MetamaterialDataset, VoxelTransform
 from src.models.diffusion import build_diffusion
 from src.models.unet3d import UNet3D
 
 LOG = logging.getLogger(__name__)
+
+# Default power-iteration budget for the Option-B connectivity proxy inside the
+# autograd graph. 60 steps converges the proxy eigenvalue tigthly enough for the
+# regime loss at a fraction of the 200-step VRAM/deep-graph cost; override with
+# ``physics_loss.iterations`` in the train config (perf block).
+DEFAULT_PHYSICS_ITERATIONS = 60
 
 
 class EMA:
@@ -64,15 +70,19 @@ def _make_logger(backend: str, project: str, run_dir: Path, config: dict):
             wandb.init(project=project, config=config, dir=str(run_dir.parent))
             return (lambda tag, val, step: wandb.log({tag: val}, step=step),
                     lambda tag, img, step: wandb.log({tag: wandb.Image(img)}, step=step))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- degraded-but-usable fallback
             LOG.warning("wandb unavailable (%s); falling back to tensorboard", e)
     from torch.utils.tensorboard import SummaryWriter
     tb = SummaryWriter(log_dir=str(run_dir))
     return (tb.add_scalar, tb.add_image)
 
 
-def _load_physics(lamb: float, device: torch.device):
-    """Option B connectivity proxy (Gowtham's module). Disabled when lambda_1 == 0."""
+def _load_physics(lamb: float, device: torch.device, iterations: int):
+    """Option B connectivity proxy (ROADMAP 4.4); disabled when lambda_1 == 0.
+
+    ``iterations`` bounds the deflated power iteration inside the autograd
+    graph: more iterations converge tighter but keep a deeper graph in VRAM.
+    """
     if lamb <= 0.0:
         return lambda *_: torch.tensor(0.0, device=device)
     try:
@@ -81,8 +91,31 @@ def _load_physics(lamb: float, device: torch.device):
         raise SystemExit(
             f"physics_loss.lambda_1 = {lamb} > 0 requires "
             "src/losses/physics_loss.py (Option B, Week 7) and cannot run without it."
-        )
-    return connectivity_proxy_loss
+        ) from None
+    return lambda x, c, t: connectivity_proxy_loss(x, c, t, iterations=int(iterations))
+
+
+def _make_augment(enabled: bool, seed: int) -> VoxelTransform | None:
+    """Deterministic proper-rotation augment keyed by the sample index.
+
+    Each sample is rotated by one of the 24 cube rotations (never a mirror),
+    derived from ``seed + sample_index``. Making the rotation a pure function
+    of the sample index keeps the augmentation reproducible run-to-run even
+    with ``num_workers > 0`` (every worker derives the same rotation for the
+    same index, instead of sharing one mutable RNG sequence whose interleaving
+    depends on worker scheduling). The conditioning vector [E, rho, nu] is
+    invariant under proper rotations for the baseline families, so the label
+    stays valid.
+    """
+    if not enabled:
+        return None
+    from src.data.augment import random_rotation, rotate_voxels
+
+    def transform(v: np.ndarray, idx: int) -> np.ndarray:
+        rng = np.random.default_rng(seed + idx)
+        return rotate_voxels(v, random_rotation(rng))
+
+    return transform
 
 
 def _parse():
@@ -106,17 +139,32 @@ def main() -> None:
     set_seed(int(tcfg["seed"]))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        perf = tcfg.get("perf", {})
+        torch.backends.cudnn.benchmark = bool(perf.get("cudnn_benchmark", True))  # fixed 32³ shapes amortize the autotune
+        torch.backends.cuda.matmul.allow_tf32 = bool(perf.get("tf32", True))
+        torch.set_float32_matmul_precision(perf.get("float32_matmul_precision", "high"))  # TF32 tensor cores on Ampere
+        torch.backends.cudnn.allow_tf32 = bool(perf.get("tf32", True))
     mp = tcfg.get("mixed_precision", "bf16")
 
-    dataset = MetamaterialDataset(REPO_ROOT / tcfg["data"]["hdf5"])
+    dataset = MetamaterialDataset(
+        REPO_ROOT / tcfg["data"]["hdf5"],
+        transform=_make_augment(tcfg["data"].get("augmentation", False),
+                                int(tcfg["seed"])),
+    )
     if args.overfit:
         dataset.voxels = dataset.voxels[:args.overfit]
         dataset.cond = dataset.cond[:args.overfit]
         bs = min(int(tcfg["batch_size"]), args.overfit)
     else:
         bs = int(tcfg["batch_size"])
+    perf = tcfg.get("perf", {})
+    nw = int(perf.get("num_workers", 0))
     loader = DataLoader(dataset, batch_size=bs, shuffle=True, drop_last=False,
-                        num_workers=0, pin_memory=device.type == "cuda")
+                        num_workers=nw,
+                        prefetch_factor=int(perf["prefetch_factor"]) if nw > 0 else None,
+                        persistent_workers=bool(perf.get("persistent_workers", False)) if nw > 0 else False,
+                        pin_memory=device.type == "cuda")
 
     model = UNet3D.from_config(mcfg["unet3d"]).to(device)
     diffusion = build_diffusion(mcfg["diffusion"], device)
@@ -140,7 +188,9 @@ def main() -> None:
     ema = EMA(model, float(ema_cfg["decay"])) if ema_cfg.get("enabled", False) else None
 
     physics_cfg = tcfg.get("physics_loss", {})
-    physics = _load_physics(float(physics_cfg.get("lambda_1", 0.0)), device)
+    physics = _load_physics(float(physics_cfg.get("lambda_1", 0.0)), device,
+                            int(physics_cfg.get("iterations",
+                                                DEFAULT_PHYSICS_ITERATIONS)))
     lamb = float(physics_cfg.get("lambda_1", 0.0))
     warmup_iters = int(float(physics_cfg.get("warmup_fraction", 0.0)) * max_iters)
 
@@ -157,7 +207,7 @@ def main() -> None:
 
     global_step = 0
     if args.resume_from:
-        ck = torch.load(args.resume_from, map_location=device)
+        ck = torch.load(args.resume_from, map_location=device, weights_only=True)
         model.load_state_dict(ck["model"])
         if ema:
             ema_shadow = ck.get("ema")
@@ -169,7 +219,8 @@ def main() -> None:
 
     t_start = time.time()
     model.train()
-    cond_test = torch.as_tensor(dataset.cond[:4].copy()).to(device)
+    n_eval = min(4, len(dataset))
+    cond_test = torch.as_tensor(dataset.cond[:n_eval].copy()).to(device)
     while global_step < max_iters:
         for x, c in loader:
             if global_step >= max_iters:
@@ -213,9 +264,13 @@ def main() -> None:
                 if ema is not None:
                     ema.apply(model)
                 model.eval()
+                sampling = mcfg.get("sampling", {})
+                steps = max(50, min(int(sampling.get("steps", 50)), 100))  # DDIM 50-100 locked
+                eval_seed = int(sampling.get("eval_seed", 0))
                 with torch.no_grad():
                     gen = diffusion.sample_ddim(model, cond_test,
-                                                (4, 1, 32, 32, 32), steps=50, seed=0)
+                                                (n_eval, 1, 32, 32, 32),
+                                                steps=steps, seed=eval_seed)
                 img = render_voxel_projection(gen)
                 log_image("eval/samples", img, global_step)
                 model.train()

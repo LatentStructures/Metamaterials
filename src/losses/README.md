@@ -68,10 +68,13 @@ lambda_2_hat = 1 - (v, M v)        (v unit)
 Each disconnected component of the graph contributes its own eigenvalue-1
 direction of `M`, so multi-component (floating-cluster) samples converge to
 `lambda_2_hat = 0` quickly -- they score `L_conn ~ 1`.  `lambda_ref` is cached
-per resolution (computed with `t_ref = 200` iterations under `no_grad`); the
-default `t = 200`, configured the same way as `lambda_ref`.  For a fully empty
-grid take `L_conn = 1` (maximally disconnected); a connected-but-floating
-single component also scores near 0 (it passes the binary validity filter).
+per resolution (computed with `t_ref = 200` iterations under `no_grad`, where
+autograd depth is irrelevant); the live-graph budget defaults to `t = 60`
+(power iterations inside the autograd graph: fewer keep the backprop graph
+shallow), configurable under `physics_loss.iterations` in the train config.
+For a fully empty grid take `L_conn = 1` (maximally disconnected); a
+connected-but-floating single component also scores near 0 (it passes the
+binary validity filter).
 This term protects the validity rate; it does not steer properties toward the
 conditioning targets — that weakness is exactly what Option A (a frozen
 surrogate critic, contingency only) fixes.

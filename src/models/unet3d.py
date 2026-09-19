@@ -140,7 +140,7 @@ class UNet3D(nn.Module):
     def __init__(self,
                  in_channels: int,
                  channels: list[int],
-                 out_channels: int,
+                 out_channels: int | None,
                  time_embed_dim: int,
                  conditioning_dim: int,
                  conditioning_embed_dim: int,
@@ -204,16 +204,18 @@ class UNet3D(nn.Module):
                 if skips:
                     h = h + skips.pop()
                 h = mod(h, emb)
-
+        if skips:
+            h = h + skips.pop()
         return self.conv_out(h)
 
     @classmethod
-    def from_config(cls, unet_cfg: dict) -> "UNet3D":
+    def from_config(cls, unet_cfg: dict) -> UNet3D:
         channels = [int(c) for c in unet_cfg["channels"]]
         res = [int(r) for r in unet_cfg.get("attention_resolutions", [])]
-        return cls(in_channels=int(unet_cfg["in_channels"]),
+        in_ch = int(unet_cfg["in_channels"])
+        return cls(in_channels=in_ch,
                    channels=channels,
-                   out_channels=int(unet_cfg["in_channels"]),
+                   out_channels=int(unet_cfg.get("out_channels", in_ch)),
                    time_embed_dim=int(unet_cfg["time_embed_dim"]),
                    conditioning_dim=int(unet_cfg["conditioning_dim"]),
                    conditioning_embed_dim=int(unet_cfg["conditioning_embed_dim"]),

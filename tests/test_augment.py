@@ -7,11 +7,11 @@ the rotated strain. Any silent tensor bug shows up here.
 import numpy as np
 
 from src.data.augment import (
-    proper_rotations,
-    rotate_voxels,
-    rotate_stiffness,
-    _voigt_to_tensor,
     _tensor_to_voigt,
+    _voigt_to_tensor,
+    proper_rotations,
+    rotate_stiffness,
+    rotate_voxels,
 )
 
 

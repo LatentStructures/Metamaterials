@@ -1,8 +1,9 @@
 """Model + diffusion tests: config-driven shapes, loss, DDIM sampling."""
+import pytest
 import torch
 
-from src.models.unet3d import UNet3D
 from src.models.diffusion import GaussianDiffusion, NoiseSchedule
+from src.models.unet3d import UNet3D
 
 CONFIG = {
     "in_channels": 1,
@@ -69,6 +70,17 @@ def test_p_losses_returns_scalar_and_decreases():
         l.backward()
         opt.step()
     assert l.item() < first, "training did not reduce eps-MSE"
+
+
+def test_ddim_rejects_invalid_steps():
+    small = {**CONFIG, "channels": [8, 16, 32, 64], "time_embed_dim": 64,
+             "conditioning_embed_dim": 64, "attention_resolutions": []}
+    d = GaussianDiffusion(T=100)
+    model = UNet3D.from_config(small)
+    c = torch.randn(1, 3)
+    for bad in (0, 101):
+        with pytest.raises(ValueError):
+            d.sample_ddim(model, c, (1, 1, 8, 8, 8), steps=bad)
 
 
 def test_ddim_samples_shape_and_reproducible():

@@ -4,6 +4,6 @@ from src.models.unet3d import UNet3D
 __all__ = [
     "GaussianDiffusion",
     "NoiseSchedule",
-    "build_diffusion",
     "UNet3D",
+    "build_diffusion",
 ]

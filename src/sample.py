@@ -15,13 +15,32 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.config import load_yaml, REPO_ROOT
+from src.config import CONDITIONING_ORDER, REPO_ROOT, load_yaml
 from src.data.dataset import read_conditioning_stats
 from src.geometry import voxels_to_surface
 from src.models.diffusion import build_diffusion
 from src.models.unet3d import UNet3D
 
 LOG = logging.getLogger(__name__)
+
+# Locked range (ROADMAP 4.3): DDIM inference uses 50-100 steps.
+DDIM_MIN_STEPS = 50
+DDIM_MAX_STEPS = 100
+
+
+def resolve_ddim_steps(cli_steps: int | None, mcfg: dict) -> int:
+    """Effective DDIM step count: CLI override else ``sampling.steps``, clamped.
+
+    ``--steps`` outside the locked 50-100 range is clamped (not rejected) so a
+    typo never silently picks a pathological trajectory length.
+    """
+    steps = int(cli_steps if cli_steps is not None
+                else mcfg.get("sampling", {}).get("steps", DDIM_MIN_STEPS))
+    if not DDIM_MIN_STEPS <= steps <= DDIM_MAX_STEPS:
+        LOG.warning("DDIM steps %d outside the locked [%d, %d] range; clamped",
+                    steps, DDIM_MIN_STEPS, DDIM_MAX_STEPS)
+        return max(DDIM_MIN_STEPS, min(steps, DDIM_MAX_STEPS))
+    return steps
 
 
 def _parse():
@@ -31,7 +50,8 @@ def _parse():
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--targets", required=True, help="csv with columns E, relative_density, nu")
     ap.add_argument("--out-dir", default="outputs/samples")
-    ap.add_argument("--steps", type=int, default=50, help="DDIM steps (50-100)")
+    ap.add_argument("--steps", type=int, default=None,
+                    help="DDIM steps (locked 50-100); default from model config sampling.steps")
     ap.add_argument("--n-per-target", type=int, default=1)
     ap.add_argument("--export-stl", action="store_true")
     return ap.parse_args()
@@ -49,19 +69,23 @@ def main() -> None:
     stats = read_conditioning_stats(dataset_h5)
 
     model = UNet3D.from_config(mcfg["unet3d"]).to(device)
-    ck = torch.load(args.checkpoint, map_location=device)
+    ck = torch.load(args.checkpoint, map_location=device, weights_only=True)
     model.load_state_dict(ck["model"])
     diffusion = build_diffusion(mcfg["diffusion"], device)
     LOG.info("loaded checkpoint iter=%s device=%s", ck.get("iter", "?"), device)
 
+    steps = resolve_ddim_steps(args.steps, mcfg)
+
     targets = pd.read_csv(args.targets)
-    required_cols = {"E", "relative_density", "nu"}
+    if targets.empty:
+        raise ValueError(f"--targets {args.targets} contains no rows")
+    required_cols = set(CONDITIONING_ORDER)
     if not required_cols.issubset(targets.columns):
         raise ValueError(
             f"--targets CSV must contain columns {required_cols}; "
             f"got {set(targets.columns)}"
         )
-    conds = targets[["E", "relative_density", "nu"]].to_numpy(dtype=np.float32)
+    conds = targets[CONDITIONING_ORDER].to_numpy(dtype=np.float32)
     conds = stats.normalize(conds)
 
     out_dir = Path(args.out_dir)
@@ -72,7 +96,7 @@ def main() -> None:
         for ti, c in enumerate(conds):
             c_b = torch.as_tensor(c[None], dtype=torch.float32, device=device).repeat(args.n_per_target, 1)
             gen = diffusion.sample_ddim(model, c_b, (args.n_per_target, 1, 32, 32, 32),
-                                        steps=args.steps, seed=0)
+                                        steps=steps, seed=0)
             for si in range(args.n_per_target):
                 v = (gen[si, 0].cpu().numpy() > 0.5).astype(np.uint8)
                 name = f"sample_t{ti:02d}_s{si:02d}"

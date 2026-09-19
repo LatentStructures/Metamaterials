@@ -13,9 +13,7 @@ import itertools
 
 import numpy as np
 
-# Voigt index order 11, 22, 33, 23, 13, 12 (engineering shear strain convention:
-# strain vector is [e11, e22, e33, g23, g13, g12] with g = 2e).
-VOIGT_PAIRS = ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1))
+from src.voigt import VOIGT_PAIRS
 
 
 def proper_rotations() -> list[np.ndarray]:
@@ -96,14 +94,6 @@ def rotate_stiffness(C6: np.ndarray, R: np.ndarray) -> np.ndarray:
     return full_to_stiffness(C4r)
 
 
-def apply_rotation(voxels: np.ndarray, C6: np.ndarray | None,
-                   R: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
-    """Rotate a (voxels, stiffness) sample consistently; keep both in lockstep."""
-    vox_r = rotate_voxels(voxels, R)
-    C_r = rotate_stiffness(C6, R) if C6 is not None else None
-    return vox_r, C_r
-
-
 def random_rotation(rng: np.random.Generator | None = None) -> np.ndarray:
     """Draw one of the 24 proper rotations uniformly."""
     rng = rng or np.random.default_rng()
@@ -114,11 +104,11 @@ def _voigt_to_tensor(e_voigt: np.ndarray) -> np.ndarray:
     """Voigt engineering-strain vector (e11,e22,e33,g23,g13,g12) -> symmetric tensor."""
     e = np.asarray(e_voigt, dtype=float)
     t = np.zeros((3, 3))
-    for i in range(3):
-        t[i, i] = e[i]
-    pairs = (1, 2), (0, 2), (0, 1)
-    for off_idx, (a, b) in enumerate(pairs):
-        t[a, b] = t[b, a] = 0.5 * e[3 + off_idx]
+    for i, (a, b) in enumerate(VOIGT_PAIRS):
+        if a == b:
+            t[a, a] = e[i]
+        else:
+            t[a, b] = t[b, a] = 0.5 * e[i]
     return t
 
 
@@ -126,9 +116,6 @@ def _tensor_to_voigt(t: np.ndarray) -> np.ndarray:
     """Symmetric strain tensor -> Voigt engineering-strain vector."""
     t = np.asarray(t, dtype=float)
     v = np.zeros(6)
-    for i in range(3):
-        v[i] = t[i, i]
-    pairs = (1, 2), (0, 2), (0, 1)
-    for off_idx, (a, b) in enumerate(pairs):
-        v[3 + off_idx] = 2.0 * t[a, b]
+    for i, (a, b) in enumerate(VOIGT_PAIRS):
+        v[i] = t[a, a] if a == b else 2.0 * t[a, b]
     return v

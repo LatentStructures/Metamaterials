@@ -34,6 +34,9 @@ from torch import nn
 
 __all__ = ["connectivity_proxy_loss"]
 
+# Off-graph iteration budget for the reference Fiedler ceiling (fully solid
+# grid). 200 steps converge it essentially exactly; it runs under no_grad, so
+# the conservative 200 is free (autograd depth does not apply).
 _REFERENCE_ITERATIONS = 200
 
 
@@ -46,21 +49,6 @@ def _unit_norm(x: torch.Tensor) -> torch.Tensor:
 def _deflate(v: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
     """Orthogonalize ``v`` against the trivial eigenvector ``u`` (per sample)."""
     return v - u * (u * v).sum(dim=(1, 2, 3, 4), keepdim=True)
-
-
-def _soft_laplacian_action(p: torch.Tensor, v: torch.Tensor,
-                           D: torch.Tensor | None = None) -> torch.Tensor:
-    """Return (L_norm v) for the weighted 26-neighbour Laplacian of ``p``.
-
-    Computed via 3x3x3 correlation without ever materialising the N x N matrix:
-    ``(A w)_i = p_i (conv(p * w) - p_i w_i)`` and ``L v = v - D^{-1/2} A D^{-1/2} v``.
-    """
-    ones = torch.ones(1, 1, 3, 3, 3, device=p.device, dtype=p.dtype)
-    dinv = (D + 1e-8).rsqrt() if D is not None else torch.ones_like(p)
-    w = dinv * v
-    pw = p * w
-    Aw = p * (nn.functional.conv3d(pw, ones, padding=1) - pw)
-    return v - dinv * Aw
 
 
 def _fiedler_estimate(p: torch.Tensor, iterations: int = 60) -> torch.Tensor:
@@ -127,7 +115,7 @@ def connectivity_proxy_loss(
     x: torch.Tensor,
     cond: torch.Tensor | None = None,
     t: torch.Tensor | None = None,
-    iterations: int = 200,
+    iterations: int = 60,
     normalize: bool = True,
 ) -> torch.Tensor:
     """Normalized soft-connectivity deficit of occupancy ``x`` (scalar).
@@ -135,6 +123,11 @@ def connectivity_proxy_loss(
     ``cond`` and ``t`` are accepted for compatibility with the training-loop
     call signature but do not influence Option B (the baseline proxy is
     unconditional -- it only protects the validity rate).
+
+    ``iterations`` bounds the power iteration that runs inside the autograd
+    graph. The default of 60 is the train-config value (``physics_loss
+    .iterations``); the off-graph reference ceiling below is always computed at
+    ``_REFERENCE_ITERATIONS`` (200), where autograd depth is irrelevant.
     """
     if x.dim() == 4:  # (B, D, H, W)
         x = x.unsqueeze(1)

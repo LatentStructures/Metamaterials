@@ -4,8 +4,8 @@ seed: 0
 data:
   hdf5: data/dataset_train.h5
   conditioning_order: [E, relative_density, nu]   # must match manifest + HDF5 /conditioning_vector (Phase 1, Section 3.4)
+  augmentation: true                              # random proper rotation per sample (the 24 cube rotations; no mirrors, Section 3.4)
 optimizer:
-  name: adamw
   lr: 1e-4
   lr_schedule: cosine                            # cosine decay (Phase 2, Section 4.5)
 ema:
@@ -13,15 +13,23 @@ ema:
   decay: 0.9999
 batch_size: 32                                   # 32³ fits on 24 GB; reduce on smaller GPUs
 mixed_precision: bf16                            # bf16 preferred where supported
-epochs: 1000                                     # full-baseline budget; overridden by --overfit
-checkpoint_every: 1000
+epochs: 500                                     # tuned budget to hit deadline; overridden by --overfit
+checkpoint_every: 500
+perf:                                             # GPU throughput knobs (src/train.py)
+  cudnn_benchmark: true                           # fixed 32³ shapes amortize the cuDNN autotune
+  tf32: true                                      # TF32 tensor cores
+  float32_matmul_precision: high                  # -> torch.set_float32_matmul_precision("high")
+  num_workers: 8                                  # host RAM keeps 8 workers fed; GPU is CPU-bound otherwise
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: true
 physics_loss:                                    # Option B only (Phase 2, Section 4.4); Option A is a contingency
   option: B
   lambda_1: 0.0
+  iterations: 60                                 # power-iteration budget inside the autograd graph (perf/VRAM trade-off)
   warmup_fraction: 0.2                           # λ₁ warmed from 0 over first 20% of training
   ablation: {lambda_1: 0.05, tag: abl_physics}   # run the ablation pair (Phase 2, Section 4.4)
 logging:
   backend: wandb                                 # or tensorboard
   project: metamaterials-baseline
-  eval_interval: 1000                            # loss curves AND rendered voxel grids (Phase 2, Section 4.5)
   sample_interval: 5000

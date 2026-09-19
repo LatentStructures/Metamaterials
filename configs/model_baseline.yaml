@@ -9,9 +9,7 @@ unet3d:
   attention_resolutions: [4]                     # bottleneck self-attention at 4³; no cross-attention (Phase 2, Section 4.2)
 diffusion:
   T: 1000                                       # DDPM training timesteps (Phase 2, Section 4.3)
-  beta_schedule: linear
-  training_loss: eps_mse                         # standard ε-MSE (L_simple)
 sampling:
   schedule: ddim
-  steps: [50, 100]                               # DDIM inference steps (Phase 2, Section 4.3)
-  target_time_per_sample_s: 60
+  steps: 50                                      # DDIM inference steps; locked 50-100 (Phase 2, Section 4.3)
+  eval_seed: 0                                   # fixed seed for eval-time DDIM renders inside training

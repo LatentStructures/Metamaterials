@@ -21,13 +21,13 @@ class NoiseSchedule:
     alpha_bar: torch.Tensor
 
     @classmethod
-    def linear(cls, T: int, beta_start: float = 1e-4, beta_end: float = 0.02) -> "NoiseSchedule":
+    def linear(cls, T: int, beta_start: float = 1e-4, beta_end: float = 0.02) -> NoiseSchedule:
         betas = torch.linspace(beta_start, beta_end, T)
         alphas = 1.0 - betas
         alpha_bar = torch.cumprod(alphas, dim=0)
         return cls(T=T, betas=betas, alphas=alphas, alpha_bar=alpha_bar)
 
-    def to(self, device: torch.device) -> "NoiseSchedule":
+    def to(self, device: torch.device) -> NoiseSchedule:
         self.betas = self.betas.to(device)
         self.alphas = self.alphas.to(device)
         self.alpha_bar = self.alpha_bar.to(device)
@@ -73,6 +73,8 @@ class GaussianDiffusion:
                     eta: float = 0.0, clamp: bool = True,
                     seed: int | None = None) -> torch.Tensor:
         """Deterministic (eta=0) DDIM sampling; steps in the DDPM grid."""
+        if not 1 <= steps <= self.T:
+            raise ValueError(f"steps must be in [1, T={self.T}], got {steps}")
         device = next(model.parameters()).device
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
         x = torch.randn(shape, device=device, generator=gen)

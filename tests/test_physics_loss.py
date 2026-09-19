@@ -56,7 +56,7 @@ def test_batched_input_scalar_output():
     b[:, 0, 2:14, 2:14, 2:14] = 1.0
     out = connectivity_proxy_loss(b)
     assert out.dim() == 0
-    assert bool(out == out)  # not NaN
+    assert bool(torch.isfinite(out))  # not NaN
 
 
 def test_epsilon_parameter_respected():
