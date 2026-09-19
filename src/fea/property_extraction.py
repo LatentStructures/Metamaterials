@@ -29,8 +29,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-# Voigt index order 11, 22, 33, 23, 13, 12 (engineering shear strain).
-VOIGT_PAIRS = ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1))
+from src.voigt import VOIGT_PAIRS
 
 
 @dataclass(frozen=True)
@@ -64,12 +63,19 @@ def voigt_isotropic(E: float, nu: float) -> np.ndarray:
 
 
 def cubic_averages(C6: np.ndarray) -> tuple[float, float, float]:
-    """Reduce a 6x6 (engineering Voigt) stiffness to cubic constants (C11, C12, C44)."""
+    """Reduce a 6x6 (engineering Voigt) stiffness to cubic constants (C11, C12, C44).
+
+    The three index blocks are read from ``VOIGT_PAIRS`` (diagonal vs shear
+    entries) rather than hardcoded ``range(3)``/``range(3, 6)`` indices, so the
+    Voigt convention lives in exactly one place.
+    """
     C6 = np.asarray(C6, dtype=float)
-    C11 = float(np.mean([C6[i, i] for i in range(3)]))
-    off = [C6[i, j] for i in range(3) for j in range(3) if i != j]
+    normal = [i for i, (a, b) in enumerate(VOIGT_PAIRS) if a == b]
+    shear = [i for i, (a, b) in enumerate(VOIGT_PAIRS) if a != b]
+    C11 = float(np.mean([C6[i, i] for i in normal]))
+    off = [C6[i, j] for i in normal for j in normal if i != j]
     C12 = float(np.mean(off))
-    C44 = float(np.mean([C6[i, i] for i in range(3, 6)]))
+    C44 = float(np.mean([C6[i, i] for i in shear]))
     return C11, C12, C44
 
 

@@ -2,7 +2,7 @@
 # Every run must be reproducible from this file alone with a fixed seed (Section 5).
 seed: 0
 resolution: 32                                   # fixed 32³ for the whole baseline
-num_cells: 2000                                  # cells per family (pre-augmentation total = num_cells * 3)
+num_cells: 200                                   # 200 per family = 600 total cells
 base_material:                                   # solid-phase props; E is a scale factor for homogenized C (Phase 1, Section 3.1)
   E: 1.0
   nu: 0.3
@@ -11,7 +11,6 @@ families:                                        # exactly these three (Phase 1,
   - octet_truss
   - gyroid
 relative_density_range: [0.1, 0.6]               # target band for sampling (Phase 1, Section 3.1)
-voxel_dtype: uint8                               # matches HDF5 /voxels schema (Phase 1, Section 3.4)
 splits:
   train: 0.8
   val: 0.1
@@ -19,12 +18,9 @@ splits:
 hdf5: data/dataset_{split}.h5                    # one file per split, chunked (Phase 1, Section 3.4)
 conditioning_order: [E, relative_density, nu]    # must match /conditioning_vector + model input (Phase 1, Section 3.4)
 manifest: data/manifest.parquet                  # keep in git; version the HDF5 binaries with DVC (Phase 1, Section 3.4)
-checkpoint_every: 100                            # resume from cell K, never restart (Phase 1, Section 3.3)
+checkpoint_every: 50                             # resume from cell K, never restart (Phase 1, Section 3.3)
+n_workers: 16                                    # parallel FEA worker processes (spawned; one dolfinx Homogenizer each); clamped to cpu count
 homogenization:
-  method: fea
   validation_tolerance: 0.05                     # ≥3 closed-form benchmarks ≤5% before full run (Phase 1, Section 3.3)
   void_scale: 1.0e-6                             # E_void = scale * E_base, nu_void = nu_base (Ersatz material)
 fea_retries: 3                                   # resample attempts per cell before skipping it
-augmentation:
-  enabled: true
-  symmetries: proper_rotations_only              # up to 24; rotate the stiffness tensor too (Phase 1, Section 3.4)

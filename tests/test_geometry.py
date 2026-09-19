@@ -3,12 +3,11 @@ import numpy as np
 import pytest
 
 from src.geometry import (
-    sample_for_density,
-    voxels_to_tetra,
-    periodic_pairing,
     parameter_bounds,
-    relative_density,
+    periodic_pairing,
+    sample_for_density,
     voxels_to_surface,
+    voxels_to_tetra,
 )
 
 FAMILIES = ("cubic_strut", "octet_truss", "gyroid")

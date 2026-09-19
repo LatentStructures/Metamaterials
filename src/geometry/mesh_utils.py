@@ -48,7 +48,7 @@ _TET_TABLE = np.array(
 # --------------------------------------------------------------------------- #
 # Structured voxel tetrahedral mesh (primary FEA input)
 # --------------------------------------------------------------------------- #
-def voxels_to_struct_tetra(voxels: np.ndarray) -> "meshio.Mesh":
+def voxels_to_struct_tetra(voxels: np.ndarray) -> meshio.Mesh:
     """Structured tet mesh of the full (res+1)^3 voxel lattice in [0, 1]^3.
 
     Every voxel (solid or void) becomes 6 conforming tets; void tets are flagged
@@ -100,43 +100,47 @@ def voxels_to_struct_tetra(voxels: np.ndarray) -> "meshio.Mesh":
 # --------------------------------------------------------------------------- #
 # Periodic boundary pairing
 # --------------------------------------------------------------------------- #
-def periodic_pairing(tet_mesh: "meshio.Mesh", resolution: int):
+def periodic_pairing(tet_mesh: meshio.Mesh, resolution: int):
     """Exact PBC pairing tables for the structured voxel mesh.
 
     Returns dict ``{axis: (ids_lo, ids_hi)}``: local node ids on the ``axis=0``
     and ``axis=1`` faces, paired 1:1 by lattice index (i.e. identical in-plane
     coordinates). Because the mesh uses the full (res+1)^3 lattice, every +face
-    node has exactly one -face partner -- no projection, no mismatch.
+    node has exactly one -face partner -- no projection, no mismatch.  The two
+    arrays are kept in correspondence and sorted by the slave (hi) id, so
+    ``ids_lo[k]`` is the partner of ``ids_hi[k]``.
     """
     pts = tet_mesh.points
-    n = resolution + 1
     pairing: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     for ax in range(3):
         on_lo = np.flatnonzero(np.isclose(pts[:, ax], 0.0))
         on_hi = np.flatnonzero(np.isclose(pts[:, ax], 1.0))
         # Pair by index within the lattice: node (0, j, k) <-> node (n-1, j, k).
-        key = lambda p: tuple(round(float(c), 9) for c in p[[j for j in range(3) if j != ax]])
-        klo = {key(pts[i]): i for i in on_lo}
-        pairs_lo = []
-        pairs_hi = []
-        for i in on_hi:
-            k = key(pts[i])
-            j = klo[k]
+        in_plane = [j for j in range(3) if j != ax]
+        klo: dict[tuple[float, ...], int] = {}
+        for i in on_lo:
+            klo[tuple(round(float(c), 9) for c in pts[i, in_plane])] = int(i)
+        pairs_lo = np.empty(len(on_hi), dtype=np.int64)
+        pairs_hi = np.empty(len(on_hi), dtype=np.int64)
+        for pos, i in enumerate(on_hi):
+            k = tuple(round(float(c), 9) for c in pts[i, in_plane])
+            j = klo.get(k)
             if j is None:
                 raise RuntimeError(
                     f"PBC pairing on axis {ax}: lattice misalignment ({k} not on "
                     "-face); this must never happen with the full-lattice mesh."
                 )
-            pairs_lo.append(int(j))
-            pairs_hi.append(int(i))
-        pairing[ax] = (np.asarray(sorted(pairs_lo)), np.asarray(sorted(pairs_hi)))
+            pairs_lo[pos] = j
+            pairs_hi[pos] = int(i)
+        order = np.argsort(pairs_hi)
+        pairing[ax] = (pairs_lo[order], pairs_hi[order])
     return pairing
 
 
 # --------------------------------------------------------------------------- #
 # Smoothed surface (rendering / inspection only)
 # --------------------------------------------------------------------------- #
-def voxels_to_surface(voxels: np.ndarray, smooth: bool = True) -> "meshio.Mesh":
+def voxels_to_surface(voxels: np.ndarray, smooth: bool = True) -> meshio.Mesh:
     """Smooth marching-cubes surface mesh of the solid phase (not for FEA).
 
     Periodic cells are never closed standalone bodies (they intersect the cell
@@ -164,6 +168,6 @@ def voxels_to_surface(voxels: np.ndarray, smooth: bool = True) -> "meshio.Mesh":
                        cells=[("triangle", faces.astype(np.int64))])
 
 
-def voxels_to_tetra(voxels: np.ndarray) -> "meshio.Mesh":
+def voxels_to_tetra(voxels: np.ndarray) -> meshio.Mesh:
     """Primary voxel -> tetra mesh entry point (structured, PBC-exact)."""
     return voxels_to_struct_tetra(voxels)

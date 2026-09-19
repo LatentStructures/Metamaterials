@@ -6,13 +6,7 @@
 - ``benchmarks``: closed-form cells (solid cube, laminate, aligned rods) and
   two-phase Voigt-Reuss bounds used as exact validation targets.
 """
-from src.fea.property_extraction import (
-    EffectiveProperties,
-    VOIGT_PAIRS,
-    cubic_averages,
-    effective_properties,
-    voigt_isotropic,
-)
+from src.fea import benchmarks
 from src.fea.homogenization import (
     Homogenizer,
     base_material,
@@ -22,10 +16,17 @@ from src.fea.homogenization import (
     validate_vs_analytical,
     void_scale,
 )
+from src.fea.property_extraction import (
+    EffectiveProperties,
+    cubic_averages,
+    effective_properties,
+    voigt_isotropic,
+)
+from src.voigt import VOIGT_PAIRS
 
 __all__ = [
-    "EffectiveProperties",
     "VOIGT_PAIRS",
+    "EffectiveProperties",
     "Homogenizer",
     "base_material",
     "benchmarks",

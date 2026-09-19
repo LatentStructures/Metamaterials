@@ -43,6 +43,16 @@ def _load_manifest(samples_dir: Path) -> pd.DataFrame:
     )
 
 
+def _safe_sample_name(name: str, source: str) -> str:
+    """Reject manifest entries that escape ``samples_dir`` (path traversal)."""
+    p = Path(name)
+    if p.is_absolute() or len(p.parts) != 1 or p.name in ("", ".", ".."):
+        raise ValueError(
+            f"{source} entry {name!r} must be a bare filename inside the samples directory"
+        )
+    return str(p)
+
+
 def rank_candidates(df: pd.DataFrame) -> pd.DataFrame:
     """Keep validity-passing rows and sort by reconstruction error ascending.
 
@@ -50,8 +60,8 @@ def rank_candidates(df: pd.DataFrame) -> pd.DataFrame:
     output), so the command still runs on a fresh ``sample.py`` directory.
     """
     df = df.copy()
-    if "valid" in df.columns and bool(df["valid"].any()):
-        df = df[df["valid"]]
+    if "valid" in df.columns:
+        df = df[df["valid"].fillna(False).astype(bool)]
     if {"E_eff", "target_E"}.issubset(df.columns):
         denom = df["target_E"].abs().clip(lower=1e-9)
         df["rel_err"] = (df["E_eff"] - df["target_E"]).abs() / denom
@@ -74,8 +84,8 @@ def _trimesh_surface(surf):
 
 def _watertight_report(mesh) -> dict:
     return {
-        "vertices": int(len(mesh.vertices)),
-        "faces": int(len(mesh.faces)),
+        "vertices": len(mesh.vertices),
+        "faces": len(mesh.faces),
         "is_watertight": bool(mesh.is_watertight),
         "euler_characteristic": int(mesh.euler_number),
     }
@@ -91,8 +101,9 @@ def run_export(samples_dir: str | Path, out_dir: str | Path, top_n: int = 5,
     candidates = rank_candidates(_load_manifest(samples_dir)).head(max(1, top_n))
     rows = []
     for _, row in candidates.iterrows():
-        fpath = samples_dir / str(row["file"])
-        name = Path(str(row["file"])).stem
+        fname = _safe_sample_name(str(row["file"]), "candidate manifest")
+        fpath = samples_dir / fname
+        name = Path(fname).stem
         entry = {"file": str(row["file"]), "name": name}
         if not fpath.exists():
             entry.update(exported=False, reason="missing")
@@ -106,22 +117,25 @@ def run_export(samples_dir: str | Path, out_dir: str | Path, top_n: int = 5,
             mesh.export(str(stl_path))
             entry.update(exported=True, stl=str(stl_path), reason="ok",
                          **_watertight_report(mesh))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- skip the sample, keep the pipeline alive
             LOG.error("export failed for %s: %s", row["file"], exc)
             entry.update(exported=False, reason=str(exc))
         rows.append(entry)
 
-    out_df = pd.DataFrame(rows)
+    out_df = pd.DataFrame(rows, columns=[
+        "file", "name", "exported", "stl", "reason",
+        "vertices", "faces", "is_watertight", "euler_characteristic",
+    ])
     out_df.to_csv(out_dir / "export_manifest.csv", index=False)
 
-    watertight = int(out_df["is_watertight"].fillna(False).astype(bool).sum()) \
-        if "is_watertight" in out_df.columns else 0
+    watertight = int(out_df["is_watertight"].fillna(False).astype(bool).sum())
+    exported = out_df["exported"].fillna(False).astype(bool)
     report = {
         "top_n": int(top_n),
-        "requested": int(len(candidates)),
-        "exported": int(out_df["exported"].sum()),
+        "requested": len(candidates),
+        "exported": int(exported.sum()),
         "watertight": watertight,
-        "failed": int((~out_df["exported"]).sum()),
+        "failed": int((~exported).sum()),
         "watertightness_expected": (
             "unit cells that intersect their cell faces are inherently open; "
             "non-watertight files are expected for those candidates"

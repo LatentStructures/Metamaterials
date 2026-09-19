@@ -2,7 +2,7 @@
 # Everything is installed from conda-forge EXCEPT torch, which is deliberately
 # not listed here: CUDA builds are machine-specific — see the README for the
 # separate `pip install` step. Python 3.11 because fenics-dolfinx 0.11 supports
-# cp311/cp312 and 3.10 was dropped upstream (ROADMAP Section 1 pins 3.10/3.11).
+# cp311/cp312 and 3.10 was dropped upstream (pinned to python=3.11).
 name: metamaterials
 channels:
   - conda-forge

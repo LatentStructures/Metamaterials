@@ -12,10 +12,9 @@
 
 import numpy as np
 import ufl
-from mpi4py import MPI
-
 from dolfinx import default_scalar_type, fem, mesh
 from dolfinx.fem.petsc import LinearProblem
+from mpi4py import MPI
 
 E = 70e9      # Young's modulus [Pa]
 NU = 0.33     # Poisson's ratio
@@ -30,8 +29,9 @@ def main() -> None:
     print(f"voxel grid: shape={voxels.shape} dtype={voxels.dtype} "
           f"solid fraction={voxels.mean():.2f}")
 
-    # 2) Substitute a solid unit cube for the FEniCSx solve -- the real
-    #    voxel->mesh pipeline is a Phase 1 deliverable (src/geometry).
+    # 2) Build a trivial solid unit cube directly (no src/ imports on purpose):
+    #    this checks the raw FEniCSx stack independently of the package. The
+    #    real periodic voxel->mesh homogenization is in src/fea (Phase 1, 3.3).
     nx = 4
     msh = mesh.create_unit_cube(MPI.COMM_WORLD, nx, nx, nx,
                                 mesh.CellType.hexahedron)

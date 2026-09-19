@@ -10,30 +10,36 @@ from __future__ import annotations
 
 import argparse
 import logging
+import multiprocessing
+import os
 import time
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from src.config import load_yaml, set_seed, REPO_ROOT
+from src.config import (
+    CONDITIONING_ORDER,
+    REPO_ROOT,
+    check_conditioning_order,
+    load_yaml,
+    set_seed,
+)
+from src.data.dataset import ConditioningStats, write_conditioned_hdf5
+from src.fea.property_extraction import effective_properties
 from src.geometry import (
+    periodic_pairing,
     sample_for_density,
     voxels_to_tetra,
-    periodic_pairing,
 )
-from src.data.dataset import write_conditioned_hdf5, ConditioningStats
-from src.fea.property_extraction import effective_properties
 
 LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # FEA interface
 # ---------------------------------------------------------------------------
-
-_HOMOGENIZER = None
-_MOCK_FEA = False
-_VALIDATION_SUMMARY = None
 
 
 def _write_validation_table(summary: dict) -> None:
@@ -51,39 +57,37 @@ def _write_validation_table(summary: dict) -> None:
     LOG.info("validation table written to %s", path)
 
 
-def _load_homogenizer(validation_tolerance: float, res: int,
+def _load_homogenizer(mock_fea: bool, validation_tolerance: float, res: int,
                       base_E: float, base_nu: float, void_scale: float):
-    global _HOMOGENIZER, _MOCK_FEA, _VALIDATION_SUMMARY
-    if _VALIDATION_SUMMARY is not None:
-        return _VALIDATION_SUMMARY
+    """Return ``(homogenizer, validation_summary)`` after the analytical preflight.
+
+    ``validation_summary`` is ``None`` for the mock homogenizer.  Raises
+    ``SystemExit`` when dolfinx is unavailable and ``mock_fea`` is not set.
+    """
     try:
         from src.fea import set_base_material, set_void_scale
         from src.fea.homogenization import Homogenizer, validate_vs_analytical
         set_base_material(base_E, base_nu)
         set_void_scale(void_scale)
         summary = validate_vs_analytical(tolerance=validation_tolerance, res=res)
-        _VALIDATION_SUMMARY = summary
         _write_validation_table(summary)
-        _HOMOGENIZER = Homogenizer(res)
         LOG.info(
             "FEA homogenization loaded (res %d, E %.3g, nu %.3g, void scale %.3g); "
             "validation within %.1f%%",
             res, base_E, base_nu, void_scale, 100 * validation_tolerance,
         )
-        return summary
+        return Homogenizer(res), summary
     except ImportError:
-        if _MOCK_FEA:
-            _HOMOGENIZER = _MockHomogenizer()
-            LOG.warning(
-                "Using --mock-fea: stiffness is UNPHYSICAL. "
-                "Do NOT commit mock data to production."
-            )
-        else:
+        if not mock_fea:
             raise SystemExit(
                 "src/fea/homogenization.py is not available.  "
                 "Run inside the conda env where dolfinx is installed."
             )
-        return None
+        LOG.warning(
+            "Using --mock-fea: stiffness is UNPHYSICAL. "
+            "Do NOT commit mock data to production."
+        )
+        return _MockHomogenizer(), None
 
 
 class _MockHomogenizer:
@@ -112,8 +116,14 @@ class _MockHomogenizer:
 # ---------------------------------------------------------------------------
 
 def _sample_all(config: dict, rng: np.random.Generator) -> list[dict]:
-    """Yield per-cell dicts with grid, achieved density, and target params."""
-    res = config["resolution"]
+    """Per-cell target specs (family + target density), in canonical order.
+
+    Voxel grids are NOT materialized here: geometry generation is deterministic
+    (``sample_for_density`` is pure) but ``octet_truss`` rasterization is costly
+    (~seconds), so real runs render each grid inside the FEA worker that is
+    about to solve it.  The parent only draws the cheap target densities in the
+    exact same order a serial run would.
+    """
     families = config["families"]
     density_lo, density_hi = config["relative_density_range"]
     num_total = config["num_cells"] * len(families)
@@ -124,13 +134,10 @@ def _sample_all(config: dict, rng: np.random.Generator) -> list[dict]:
     for family, n in zip(families, cells_per_family):
         for _ in range(n):
             target_rho = rng.uniform(density_lo, density_hi)
-            grid, achieved_rho = sample_for_density(family, target_rho, res)
-            samples.append(dict(
-                family=family,
-                target_density=target_rho,
-                achieved_density=achieved_rho,
-                voxels=grid,
-            ))
+            samples.append({
+                "family": family,
+                "target_density": target_rho,
+            })
     return samples
 
 
@@ -151,15 +158,157 @@ def _stratify_splits(samples: list[dict], frac: dict[str, float],
     for idxs in buckets.values():
         rng.shuffle(idxs)
         total = len(idxs)
+        if total < 3:  # too small to split usefully: keep the whole bucket in train
+            result["train"].extend(idxs)
+            continue
         n_test = max(1, round(total * frac.get("test", 0.1)))
         n_val = max(1, round(total * frac.get("val", 0.1)))
-        n_train = max(0, total - n_test - n_val)
+        n_train = max(1, total - n_test - n_val)
+        # keep at least one cell per split even if the fractions round otherwise
+        n_test = min(n_test, total - n_train - 1)
+        n_val = min(n_val, total - n_train - n_test)
+        n_train = total - n_test - n_val
         result["train"].extend(idxs[:n_train])
         result["val"].extend(idxs[n_train:n_train + n_val])
         result["test"].extend(idxs[n_train + n_val:])
-    for k in result:
-        rng.shuffle(result[k])
+    for idxs in result.values():
+        rng.shuffle(idxs)
     return result
+
+
+def _check_cross_split_leakage(records: list[dict], splits: dict[str, list[int]]) -> int:
+    """Check that identical voxel grids do not leak across splits (ROADMAP 3.4).
+
+    Returns the number of cross-split duplicate pairs found.
+    """
+    hashes: dict[bytes, tuple[str, int]] = {}
+    leakages = 0
+    for split_name, idxs in splits.items():
+        for i in idxs:
+            v_bytes = np.ascontiguousarray(records[i]["voxels"]).tobytes()
+            if v_bytes in hashes:
+                prev_split, prev_i = hashes[v_bytes]
+                if prev_split != split_name:
+                    leakages += 1
+                    LOG.warning(
+                        "cross-split identical voxel grid: %s cell %d matches %s cell %d",
+                        prev_split, prev_i, split_name, i
+                    )
+            else:
+                hashes[v_bytes] = (split_name, i)
+    return leakages
+
+
+# ---------------------------------------------------------------------------
+# Worker functions (multiprocess FEA path)
+# ---------------------------------------------------------------------------
+
+_WKOPTS: dict = {}
+
+
+def _init_worker(opts: dict) -> None:
+    """Per-process setup: independent Homogenizer + cached res-locked mesh.
+
+    Also caps the intra-process BLAS/PETSc thread count so ``n_workers``
+    processes never *multiply* the core count (on a 20-core box, 12 workers
+    with unlimited OpenBLAS threads thrash instead of scale).
+    """
+    threads = max(1, int(opts.get("omp_threads", 1)))
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ[var] = str(threads)
+    from src.fea import set_base_material, set_void_scale
+    from src.fea.homogenization import Homogenizer
+    _WKOPTS.clear()
+    _WKOPTS.update(opts)
+    set_base_material(opts["base_E"], opts["base_nu"])
+    set_void_scale(opts["void_scale"])
+    _WKOPTS["homogenizer"] = _MockHomogenizer() if opts["mock_fea"] else Homogenizer(opts["res"])
+    _WKOPTS["mesh"], _WKOPTS["pairings"] = _build_mesh_and_pairings(opts["res"])
+    LOG.info("worker %s ready (pid %d, %d BLAS thread%s)",
+             "mock" if opts["mock_fea"] else "FEA", os.getpid(),
+             threads, "s" if threads != 1 else "")
+
+
+def _build_mesh_and_pairings(res: int) -> tuple:
+    """The structured lattice mesh depends only on ``res``, not on the voxels.
+
+    The void flags in the meshio mesh are never read by the homogenizer (it
+    derives per-cell material from the voxel grid at solve time), so building
+    the mesh and PBC tables once per resolution is exact -- and avoids
+    rebuilding 196,608 tets for every one of ~3,000 cells.
+    """
+    dummy = np.zeros((res, res, res), dtype=np.uint8)
+    mesh = voxels_to_tetra(dummy)
+    return mesh, periodic_pairing(mesh, res)
+
+
+def _homogenize_with_retry(family: str, target_rho: float, res: int,
+                           homogenizer, mesh, pairings: dict,
+                           max_attempts: int, seed: int, index: int
+                           ) -> tuple[np.ndarray, np.ndarray, float]:
+    """Rasterize + homogenize one cell, retrying with a density jitter on failure.
+
+    Returns ``(C6, final_grid, fea_time_s)`` where ``final_grid`` is the grid
+    actually solved (a jitter retry may have regenerated the geometry). Raises
+    ``RuntimeError`` after ``max_attempts``.
+    """
+    grid, _ = sample_for_density(family, target_rho, res)
+    for attempt in range(max_attempts):
+        try:
+            C6 = homogenizer(grid, mesh, pairings, res)
+            fea_time = float(homogenizer.times[-1]) if homogenizer.times else float("nan")
+            return C6.astype(np.float32), grid, fea_time
+        except Exception:
+            LOG.warning("sample %d (%s, target rho %.3f) FEA failed "
+                        "(attempt %d/%d)", index, family, target_rho,
+                        attempt + 1, max_attempts, exc_info=True)
+            if attempt + 1 == max_attempts:
+                break
+            jitter = float(np.random.default_rng(
+                seed + index + attempt).uniform(-2e-2, 2e-2))
+            target = min(0.999, max(1e-3, target_rho + jitter))
+            grid, _ = sample_for_density(family, target, res)
+    raise RuntimeError(
+        f"sample {index} ({family}) permanently failed after {max_attempts} attempts"
+    )
+
+
+def _process_cell(i: int, s: dict) -> dict:
+    """Homogenize one cell inside a worker; retries with jitter on failure.
+
+    Returns ``{"C6", "fea_time_s", "voxels"}`` where ``voxels`` is the FINAL
+    grid actually solved (a retried jitter target may have regenerated the
+    geometry).  Raises after ``max_attempts`` per-cell retries.
+    """
+    opts = _WKOPTS
+    C6, grid, t = _homogenize_with_retry(
+        s["family"], float(s["target_density"]), opts["res"],
+        opts["homogenizer"], opts["mesh"], opts["pairings"],
+        opts["max_attempts"], opts["seed"], i)
+    return {"C6": C6, "fea_time_s": t, "voxels": grid}
+
+
+def _assemble_record(i: int, s: dict, C6: np.ndarray, fea_time_s: float,
+                     voxdir: Path, grid: np.ndarray) -> dict:
+    """Build the record dict stored in the checkpoint (shared by both paths)."""
+    ep = effective_properties(C6)
+    rho = float(grid.sum()) / grid.size
+    vox_path = voxdir / f"vox_{i:05d}.npy"
+    np.save(vox_path, grid)
+    properties = {"E": float(ep.E), "relative_density": rho, "nu": float(ep.nu)}
+    rec = dict(s)
+    rec["voxels"] = grid
+    rec.update(
+        C6=C6.astype(np.float32),
+        achieved_density=rho,
+        E_eff=float(ep.E),
+        nu_eff=float(ep.nu),
+        fea_time_s=float(fea_time_s),
+        voxel_path=vox_path.name,  # relative: checkpoints stay portable across clones
+        sample_index=i,
+        cond=np.array([properties[k] for k in CONDITIONING_ORDER], dtype=np.float32),
+    )
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -170,21 +319,34 @@ def _load_checkpoint(path: Path) -> list[dict]:
     if not path.exists():
         return []
     df = pd.read_parquet(path)
-    c6_cols = [c for c in df.columns if c.startswith("C6_")]
+    # Sort C6_<k> columns numerically: parquet round-trips need not preserve
+    # column order, and a lexical sort would mis-map C6_10..C6_35.
+    c6_cols = sorted((c for c in df.columns if c.startswith("C6_")),
+                     key=lambda c: int(c.rsplit("_", 1)[1]))
+    # Legacy checkpoints wrote cond_rho; canonical ones use the locked names.
+    legacy = {"E": "cond_E", "relative_density": "cond_rho", "nu": "cond_nu"}
+    def _cond_col(name: str) -> str:
+        col = f"cond_{name}"
+        return col if col in df.columns else legacy[name]
+    def _row_cond(row) -> np.ndarray:
+        return np.array([float(row[_cond_col(name)]) for name in CONDITIONING_ORDER],
+                        dtype=np.float32)
     out = []
     for _, row in df.iterrows():
         C6 = np.zeros((6, 6), dtype=np.float32)
         if c6_cols:
             C6.flat[:] = row[c6_cols].to_numpy(dtype=np.float32)
+        sample_index = int(row["sample_index"]) if "sample_index" in df.columns else None
         out.append({
             "family": row["family"],
             "achieved_density": float(row["achieved_density"]),
             "target_density": float(row["target_density"]),
-            "voxel_path": Path(row["voxel_path"]),
-            "cond": np.array(
-                [row["cond_E"], row["cond_rho"], row["cond_nu"]], dtype=np.float32
-            ),
+            "E_eff": float(row["E_eff"]) if "E_eff" in df.columns else float(row.get("cond_E", np.nan)),
+            "nu_eff": float(row["nu_eff"]) if "nu_eff" in df.columns else float(row.get("cond_nu", np.nan)),
+            "voxel_path": Path(str(row["voxel_path"])),
+            "cond": _row_cond(row),
             "fea_time_s": float(row.get("fea_time_s", np.nan)),
+            "sample_index": sample_index,
             "C6": C6,
         })
     return out
@@ -199,12 +361,14 @@ def _save_checkpoint(records: list[dict], path: Path) -> None:
             "family": r["family"],
             "achieved_density": r["achieved_density"],
             "target_density": r["target_density"],
+            "E_eff": float(r.get("E_eff", c[CONDITIONING_ORDER.index("E")])),
+            "nu_eff": float(r.get("nu_eff", c[CONDITIONING_ORDER.index("nu")])),
             "voxel_path": str(r.get("voxel_path", "")),
-            "cond_E": float(c[0]),
-            "cond_rho": float(c[1]),
-            "cond_nu": float(c[2]),
             "fea_time_s": float(r.get("fea_time_s", np.nan)),
+            "sample_index": int(r.get("sample_index", -1)),
         }
+        for k, name in enumerate(CONDITIONING_ORDER):
+            row[f"cond_{name}"] = float(c[k])
         C6 = r.get("C6")
         if C6 is not None:
             for k in range(36):
@@ -218,20 +382,77 @@ def _save_checkpoint(records: list[dict], path: Path) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def generate(config_path: str | Path, mock_fea: bool = False) -> None:
-    global _MOCK_FEA
-    _MOCK_FEA = mock_fea
+def _run_parallel(records: list[dict], pending: list[tuple[int, dict]],
+                  n_workers: int, max_attempts: int, seed: int, res: int,
+                  base_E: float, base_nu: float, void_scale: float,
+                  ckpt_file: Path, checkpoint_every: int, voxdir: Path,
+                  total: int, t0: float) -> tuple[list[dict], int]:
+    """Homogenize many cells across independent dolfinx worker processes."""
+    n_workers = max(1, min(n_workers, os.cpu_count() or 1))
+    omp_threads = max(1, (os.cpu_count() or 1) // n_workers)
+    opts = {
+        "seed": seed,
+        "res": res,
+        "base_E": base_E,
+        "base_nu": base_nu,
+        "void_scale": void_scale,
+        "max_attempts": max_attempts,
+        "mock_fea": False,
+        "omp_threads": omp_threads,
+    }
+    failed = 0
+    n_completed = 0
+    LOG.info("running %d cells on %d worker processes (%d already in checkpoint)",
+             len(pending), n_workers, len(records))
+    with ProcessPoolExecutor(
+            max_workers=n_workers, initializer=_init_worker, initargs=(opts,),
+            mp_context=multiprocessing.get_context("spawn")) as ex:
+        futures = {ex.submit(_process_cell, i, s): (i, s) for i, s in pending}
+        for fut in as_completed(futures):
+            i, s = futures[fut]
+            try:
+                out = fut.result()
+            except Exception:
+                failed += 1
+                LOG.exception("sample %d (%s) failed", i, s["family"])
+                continue
+            s["voxels"] = out["voxels"]  # final grid (may be a jitter retry)
+            try:
+                rec = _assemble_record(i, s, out["C6"], out["fea_time_s"],
+                                       voxdir, out["voxels"])
+            except ValueError as exc:
+                failed += 1
+                LOG.error("sample %d (%s) produced an unphysical stiffness (%s); skipping",
+                          i, s["family"], exc)
+                continue
+            records.append(rec)
+            n_completed += 1
+            if n_completed % checkpoint_every == 0:
+                _save_checkpoint(records, ckpt_file)
+                LOG.info("checkpoint %d/%d (%.1f%%) at %.1fs",
+                         len(records), total,
+                         100 * len(records) / total, time.time() - t0)
 
+    _save_checkpoint(records, ckpt_file)
+    return records, failed
+
+
+def generate(config_path: str | Path, mock_fea: bool = False,
+             n_workers: int | None = None) -> None:
     config = load_yaml(config_path)
+    check_conditioning_order(config)
     res = config["resolution"]
     seed = config["seed"]
     set_seed(seed)
+    if n_workers is None:
+        n_workers = int(config.get("n_workers", 0))
 
     base_E = float(config["base_material"]["E"])
     base_nu = float(config["base_material"]["nu"])
     void_scale = float(config["homogenization"].get("void_scale", 1.0e-6))
     val_tol = config["homogenization"]["validation_tolerance"]
-    _VALIDATION_SUMMARY = _load_homogenizer(val_tol, res, base_E, base_nu, void_scale)
+    homogenizer, validation = _load_homogenizer(
+        mock_fea, val_tol, res, base_E, base_nu, void_scale)
 
     checkpoint_every = config.get("checkpoint_every", 100)
     ckpt_dir = REPO_ROOT / "data" / "checkpoints"
@@ -243,76 +464,57 @@ def generate(config_path: str | Path, mock_fea: bool = False) -> None:
 
     samples = _sample_all(config, np.random.default_rng(seed))
     total = len(samples)
-    per_family = ", ".join(
-        f"{c} {f}" for f, c in zip(
-            config["families"],
-            [sum(1 for s in samples if s["family"] == f) for f in config["families"]],
-        )
-    )
+    counts = Counter(s["family"] for s in samples)
+    per_family = ", ".join(f"{counts[f]} {f}" for f in config["families"])
     LOG.info("Prepared %d samples (%s)", total, per_family)
 
     records: list[dict] = []
-    for i, s in enumerate(existing):
-        voxels = np.load(s["voxel_path"])
+    done: set[int] = set()
+    for s in existing:
+        vp = Path(s["voxel_path"])
+        # Legacy checkpoints stored absolute paths; resolve relative names
+        # against the voxel directory so clones stay resumable.
+        voxels = np.load(vp if vp.is_absolute() else voxdir / vp)
         s["voxels"] = voxels
         records.append(s)
-    skip = len(records)
+        idx = s.get("sample_index")
+        if idx is None:  # legacy checkpoint: recover the sample index from the file name
+            idx = int(Path(s["voxel_path"]).stem.rsplit("_", 1)[1])
+        done.add(idx)
 
     max_attempts = int(config.get("fea_retries", 3))
     failed = 0
     t0 = time.time()
-    for i, s in enumerate(samples[skip:], start=skip):
-        grid = s["voxels"]
-        target_rho = s["target_density"]
 
-        C6 = None
-        for attempt in range(max_attempts):
+    pending = [(i, s) for i, s in enumerate(samples) if i not in done]
+    if not pending:
+        LOG.info("all %d samples already in checkpoint; skipping FEA", total)
+    elif n_workers is not None and n_workers > 1 and not mock_fea:
+        records, failed = _run_parallel(
+            records, pending, n_workers, max_attempts, seed, res, base_E, base_nu,
+            void_scale, ckpt_file, checkpoint_every, voxdir, total, t0)
+    else:
+        if mock_fea and (n_workers or 1) > 1:
+            LOG.warning("n_workers>1 ignored for --mock-fea (serial); "
+                        "multiprocessing only applies to the real FEA path")
+        mesh, pairings = _build_mesh_and_pairings(res)
+        for i, s in pending:
             try:
-                mesh = voxels_to_tetra(grid)
-                pairings = periodic_pairing(mesh, res)
-                C6 = _HOMOGENIZER(grid, mesh, pairings, res)
-                break
-            except Exception:
-                LOG.warning("sample %d (%s, target rho %.3f) FEA failed "
-                            "(attempt %d/%d)", i, s["family"], target_rho,
-                            attempt + 1, max_attempts)
-                if attempt + 1 < max_attempts:
-                    jitter = float(np.random.default_rng(seed + i + attempt)
-                                   .uniform(-2e-2, 2e-2))
-                    target = min(0.999, max(1e-3, target_rho + jitter))
-                    grid, _ = sample_for_density(s["family"], target, res)
+                C6, grid, fea_time = _homogenize_with_retry(
+                    s["family"], float(s["target_density"]), res, homogenizer,
+                    mesh, pairings, max_attempts, seed, i)
+                rec = _assemble_record(i, s, C6, fea_time, voxdir, grid)
+            except (RuntimeError, ValueError) as exc:
+                failed += 1
+                LOG.error("sample %d (%s) failed and was skipped: %s",
+                          i, s["family"], exc)
+                continue
+            records.append(rec)
 
-        if C6 is None:
-            failed += 1
-            LOG.error("sample %d (%s) permanently failed after %d attempts; skipping",
-                      i, s["family"], max_attempts)
-            continue
-
-        try:
-            ep = effective_properties(C6)
-        except ValueError as exc:
-            failed += 1
-            LOG.error("sample %d (%s) produced an unphysical stiffness (%s); skipping",
-                      i, s["family"], exc)
-            continue
-
-        rho = float(grid.sum()) / grid.size
-        fea_time = _HOMOGENIZER.times[-1] if _HOMOGENIZER.times else float("nan")
-
-        vox_path = voxdir / f"vox_{i:05d}.npy"
-        np.save(vox_path, grid)
-
-        s["C6"] = C6.astype(np.float32)
-        s["achieved_density"] = rho
-        s["fea_time_s"] = float(fea_time)
-        s["voxel_path"] = vox_path
-        s["cond"] = np.array([ep.E, rho, ep.nu], dtype=np.float32)
-        records.append(s)
-
-        if (i + 1) % checkpoint_every == 0:
-            _save_checkpoint(records, ckpt_file)
-            elapsed = time.time() - t0
-            LOG.info("checkpoint %d/%d (%.1f%%) at %.1fs", i + 1, total, 100 * (i + 1) / total, elapsed)
+            if (i + 1) % checkpoint_every == 0:
+                _save_checkpoint(records, ckpt_file)
+                elapsed = time.time() - t0
+                LOG.info("checkpoint %d/%d (%.1f%%) at %.1fs", i + 1, total, 100 * (i + 1) / total, elapsed)
 
     _save_checkpoint(records, ckpt_file)
     LOG.info("FEA complete: %d records (%d failed/skipped); "
@@ -321,9 +523,24 @@ def generate(config_path: str | Path, mock_fea: bool = False) -> None:
              float(np.mean([r.get("fea_time_s", 0.0) for r in records])) if records else 0.0,
              time.time() - t0)
 
+    # Resume with failures may leave records out of sample order; restore the
+    # canonical 0..N-1 ordering so cell_id == sample index throughout.
+    records.sort(key=lambda r: r.get("sample_index", -1))
+
+    if not records:
+        raise RuntimeError(
+            "no cells were successfully homogenized; refusing to write empty "
+            "HDF5 splits and a manifest"
+        )
+
     splits = _stratify_splits(records, config["splits"],
                               config["relative_density_range"],
                               np.random.default_rng(seed + 1))
+    leakages = _check_cross_split_leakage(records, splits)
+    if leakages == 0:
+        LOG.info("cross-split duplicate check: 0 duplicate pairs across splits")
+    else:
+        LOG.warning("cross-split duplicate check: %d duplicate pairs detected", leakages)
 
     all_conds = np.stack([r["cond"] for r in records])
     train_conds = all_conds[splits["train"]]
@@ -334,16 +551,38 @@ def generate(config_path: str | Path, mock_fea: bool = False) -> None:
     stats.mean = stats.mean.astype(np.float32)
     stats.std = stats.std.astype(np.float32)
 
+    has_stiffness = records[0].get("C6") is not None
+    meta_dtype = np.dtype([
+        ("family", "S16"),
+        ("target_density", "f4"),
+        ("achieved_density", "f4"),
+        ("E_eff", "f4"),
+        ("nu_eff", "f4"),
+        ("valid", "u1"),
+    ])
     split_frac = config["splits"]
     for split_name in split_frac:
         idxs = splits[split_name]
+        if not idxs:
+            LOG.warning("split '%s' empty; skipping HDF5 write", split_name)
+            continue
         vox = np.stack([records[i]["voxels"] for i in idxs])
         cond = np.stack([records[i]["cond"] for i in idxs])
         cond_norm = stats.normalize(cond)
-        stiff = np.stack([records[i]["C6"] for i in idxs]) if records[0].get("C6") is not None else None
+        stiff = np.stack([records[i]["C6"] for i in idxs]) if has_stiffness else None
+        meta = np.zeros(len(idxs), dtype=meta_dtype)
+        for k, i in enumerate(idxs):
+            r = records[i]
+            meta[k]["family"] = r["family"].encode("utf-8")
+            meta[k]["target_density"] = float(r.get("target_density", np.nan))
+            meta[k]["achieved_density"] = float(r["achieved_density"])
+            meta[k]["E_eff"] = float(r.get("E_eff", r["cond"][CONDITIONING_ORDER.index("E")]))
+            meta[k]["nu_eff"] = float(r.get("nu_eff", r["cond"][CONDITIONING_ORDER.index("nu")]))
+            meta[k]["valid"] = 1
 
         h5_path = REPO_ROOT / config["hdf5"].format(split=split_name)
-        write_conditioned_hdf5(h5_path, vox, cond_norm, stiffness=stiff, stats=stats, chunk=64)
+        write_conditioned_hdf5(h5_path, vox, cond_norm, stiffness=stiff,
+                               metadata=meta, stats=stats, chunk=64)
         LOG.info("wrote %s: %d samples to %s", split_name, len(idxs), h5_path)
 
     manifest_rows = []
@@ -355,10 +594,11 @@ def generate(config_path: str | Path, mock_fea: bool = False) -> None:
             "family": r["family"],
             "achieved_density": float(r["achieved_density"]),
             "target_density": float(r["target_density"]),
-            "E_eff": float(r["cond"][0]),
-            "nu_eff": float(r["cond"][2]),
+            "E_eff": float(r.get("E_eff", r["cond"][CONDITIONING_ORDER.index("E")])),
+            "nu_eff": float(r.get("nu_eff", r["cond"][CONDITIONING_ORDER.index("nu")])),
             "fea_time_s": float(r.get("fea_time_s", np.nan)),
-            "voxel_path": str(r.get("voxel_path", "")),
+            "voxel_path": str(voxdir / Path(r.get("voxel_path", "")))
+                           if r.get("voxel_path") else "",
             "hdf5_path": config["hdf5"].format(split=split_name),
         })
     manifest = pd.DataFrame(manifest_rows)
@@ -368,7 +608,7 @@ def generate(config_path: str | Path, mock_fea: bool = False) -> None:
     LOG.info("manifest written to %s", manifest_path)
 
     _write_data_card(manifest, config, records, failed,
-                     void_scale, float(time.time() - t0), _VALIDATION_SUMMARY)
+                     void_scale, float(time.time() - t0), validation)
 
 
 def _write_data_card(manifest: pd.DataFrame, config: dict, records: list[dict],
@@ -395,20 +635,19 @@ def _write_data_card(manifest: pd.DataFrame, config: dict, records: list[dict],
         f"- **wall time (FEA)**: {wall_s:.1f}s",
         "",
         "## FEA configuration",
-        f"- base material: E={config['base_material']['E']}, "
-        f"nu={config['base_material']['nu']}",
+        f"- base material: E={config['base_material']['E']}, nu={config['base_material']['nu']}",
         f"- void scale: {_f(void_scale)} (E_void = scale * E, nu_void = nu_base)",
         f"- validation tolerance: {config['homogenization']['validation_tolerance']}",
         "",
-        "## Conditioning targets (order [E, relative_density, nu])",
+        f"## Conditioning targets (order {CONDITIONING_ORDER})",
         "| quantity | min | p50 | p95 | max |",
         "|----------|-----|-----|-----|-----|",
-        f"| E_eff | {_f(e_eff.min())} | {_f(np.median(e_eff))} | "
-        f"{_f(np.percentile(e_eff, 95))} | {_f(e_eff.max())} |",
-        f"| relative_density | {_f(rho_raw.min())} | {_f(np.median(rho_raw))} | "
-        f"{_f(np.percentile(rho_raw, 95))} | {_f(rho_raw.max())} |",
-        f"| nu_eff | {_f(nu_eff.min())} | {_f(np.median(nu_eff))} | "
-        f"{_f(np.percentile(nu_eff, 95))} | {_f(nu_eff.max())} |",
+        (f"| E_eff | {_f(e_eff.min())} | {_f(np.median(e_eff))} |"
+            f" {_f(np.percentile(e_eff, 95))} | {_f(e_eff.max())} |"),
+        (f"| relative_density | {_f(rho_raw.min())} | {_f(np.median(rho_raw))} |"
+            f" {_f(np.percentile(rho_raw, 95))} | {_f(rho_raw.max())} |"),
+        (f"| nu_eff | {_f(nu_eff.min())} | {_f(np.median(nu_eff))} |"
+            f" {_f(np.percentile(nu_eff, 95))} | {_f(nu_eff.max())} |"),
         "",
         "## Per-family counts",
     ]
@@ -418,8 +657,8 @@ def _write_data_card(manifest: pd.DataFrame, config: dict, records: list[dict],
         lines += [
             "",
             "## FEA timing (s/cell)",
-            f"- mean {fea_times.mean():.3f}, median {np.median(fea_times):.3f}, "
-            f"p95 {np.percentile(fea_times, 95):.3f}, max {fea_times.max():.3f}",
+            (f"- mean {fea_times.mean():.3f}, median {np.median(fea_times):.3f},"
+            f" p95 {np.percentile(fea_times, 95):.3f}, max {fea_times.max():.3f}"),
         ]
     if validation is not None:
         lines += [
@@ -442,13 +681,19 @@ def _write_data_card(manifest: pd.DataFrame, config: dict, records: list[dict],
 
 
 def main() -> None:
+    if multiprocessing.current_process().name != "MainProcess":
+        # Spawned worker children re-import this module as __main__; never
+        # let them re-enter the CLI.
+        return
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("config", help="Path to dataset.yaml")
     ap.add_argument("--mock-fea", action="store_true",
                     help="Use an UNPHYSICAL placeholder stiffness (pipeline testing only)")
+    ap.add_argument("--n-workers", type=int, default=None,
+                    help="Number of FEA worker processes (overrides config n_workers)")
     args = ap.parse_args()
-    generate(args.config, mock_fea=args.mock_fea)
+    generate(args.config, mock_fea=args.mock_fea, n_workers=args.n_workers)
 
 
 if __name__ == "__main__":

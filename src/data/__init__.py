@@ -1,5 +1,4 @@
 from src.data.augment import (
-    apply_rotation,
     proper_rotations,
     random_rotation,
     rotate_stiffness,
@@ -13,13 +12,12 @@ from src.data.dataset import (
 )
 
 __all__ = [
-    "apply_rotation",
-    "proper_rotations",
-    "random_rotation",
-    "rotate_stiffness",
-    "rotate_voxels",
     "ConditioningStats",
     "MetamaterialDataset",
+    "proper_rotations",
+    "random_rotation",
     "read_conditioning_stats",
+    "rotate_stiffness",
+    "rotate_voxels",
     "write_conditioned_hdf5",
 ]

@@ -18,9 +18,9 @@ bisection so the dataset generator can target the section 3.1 density band
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import lru_cache
 from itertools import product
-from typing import Callable
 
 import numpy as np
 
@@ -56,7 +56,7 @@ def _fcc_nearest_neighbour_struts() -> list[tuple[np.ndarray, np.ndarray]]:
     pts = [
         np.array(p, dtype=float)
         for p in product(units, repeat=3)
-        if (int(round(p[0] * 2)) + int(round(p[1] * 2)) + int(round(p[2] * 2))) % 2 == 0
+        if (round(p[0] * 2) + round(p[1] * 2) + round(p[2] * 2)) % 2 == 0
     ]
     struts: list[tuple[np.ndarray, np.ndarray]] = []
     for i in range(len(pts)):
@@ -172,8 +172,8 @@ def sample_for_density(
             hi, d_hi = mid, d_mid
     # Pick the bracketing parameter with the achieved density closest to target.
     if abs(d_hi - target_density) < abs(d_lo - target_density):
-        final_p, final_d = hi, d_hi
+        final_p = hi
     else:
-        final_p, final_d = lo, d_lo
+        final_p = lo
     grid = generate_voxels(family, final_p, resolution)
     return grid, float(relative_density(grid))

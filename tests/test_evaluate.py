@@ -1,9 +1,9 @@
 """Tests for the FEA-verified evaluation + synthesizability filter (4.6)."""
 from __future__ import annotations
 
-import json
 import numpy as np
 import pandas as pd
+import pytest
 
 import src.evaluate as ev
 
@@ -44,6 +44,24 @@ def test_connectivity_floating_voxel_rejected():
 def test_empty_grid_has_zero_components():
     assert ev.compute_components(np.zeros((4, 4, 4), dtype=np.uint8)) == 0
     assert ev.filter_connectivity(np.zeros((4, 4, 4), dtype=np.uint8)) is False
+
+
+def test_corner_touching_voxels_are_one_component():
+    """26-connectivity: cubes meeting only at a corner count as connected.
+
+    This is the convention shared with the Option-B physics proxy, so the soft
+    and hard validity signals agree on corner-touching structures.
+    """
+    vol = np.zeros((4, 4, 4), dtype=np.uint8)
+    vol[0, 0, 0] = 1                      # corner cube
+    vol[1, 1, 1] = 1                      # touches it only at one corner
+    assert ev.compute_components(vol) == 1
+    assert ev.filter_connectivity(vol) is True
+    # two cubes separated by a full-voxel gap are definitely disconnected
+    vol2 = np.zeros((4, 4, 4), dtype=np.uint8)
+    vol2[0, :, :] = 1
+    vol2[3, :, :] = 1
+    assert ev.compute_components(vol2) == 2
 
 
 def test_min_wall_thickness_thick_passes():
@@ -111,6 +129,11 @@ def test_reconstruction_metrics_known_values():
     assert m["E"]["mean_abs_rel_err"] == 0.5
     assert m["relative_density"]["mean_abs_rel_err"] == 0.0
     assert m["E"]["bias"] == -1.0
+
+
+def test_reconstruction_metrics_rejects_shape_mismatch():
+    with pytest.raises(ValueError):
+        ev.reconstruction_metrics(np.zeros((3, 2)), np.zeros((3, 3)), ev.COND_NAMES)
 
 
 # --------------------------------------------------------------------------- #

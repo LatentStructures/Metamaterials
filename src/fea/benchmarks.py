@@ -20,9 +20,9 @@ before any dataset generation is allowed to run:
    ``C11 - nu*(C12 + C13) = f_s E_s + f_v E_v`` together with the five
    transverse/homogenisation combinations ``Cj1 - nu*(Cj2 + Cj3) = 0``.
 
-``voigt_reuss_bounds`` additionally computes the two-phase Voigt and Reuss
-bounds on the diagonal entries, applied to the real (non-closed-form) family
-microstructures as a sanity gate.
+``voigt_reuss_bounds`` provides the two-phase Voigt and Reuss bounds on the
+stiffness diagonal; it is used by the validation tests as a bracketing check on
+the computed effective tensors.
 
 All Voigt matrices use the engineering strain convention matching
 ``src/data/augment.py``: strain vector ``[e11, e22, e33, g23, g13, g12]``.
@@ -30,8 +30,6 @@ All Voigt matrices use the engineering strain convention matching
 from __future__ import annotations
 
 import numpy as np
-
-from .property_extraction import voigt_isotropic
 
 # unit macroscopic strain load cases as engineering-strain vectors
 # (e11, e22, e33, g23, g13, g12)
@@ -83,7 +81,7 @@ def laminate_stiffness(f_s: float, E_s: float, nu_s: float,
             0.0, 0.0,
             e11, g12, g13,
         ])
-        eps11s, eps11v, g12s, g12v, g13s, g13v = np.linalg.solve(A, b)
+        eps11s, eps11v, g12s, _g12v, g13s, _g13v = np.linalg.solve(A, b)
         s11 = (lam[0] + 2.0 * mu[0]) * eps11s + lam[0] * t
         s22 = (f_s * ((lam[0] + 2.0 * mu[0]) * e22 + lam[0] * (eps11s + e33))
                + f_v * ((lam[1] + 2.0 * mu[1]) * e22 + lam[1] * (eps11v + e33)))
@@ -167,7 +165,7 @@ def rods_grid(res: int, rho: float) -> tuple[np.ndarray, float]:
     the first ``y`` rows, which turns the benchmark into a laminate and breaks
     the axial (rule-of-mixtures) closure.
     """
-    ncols = int(round(rho * res * res))
+    ncols = round(rho * res * res)
     ncols = max(1, min(ncols, res * res - 1))
     cols = np.zeros(res * res, dtype=np.uint8)
     cols.flat[np.random.default_rng(0).permutation(res * res)[:ncols]] = 1
