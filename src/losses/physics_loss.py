@@ -125,9 +125,10 @@ def connectivity_proxy_loss(
     unconditional -- it only protects the validity rate).
 
     ``iterations`` bounds the power iteration that runs inside the autograd
-    graph. The default of 60 is the train-config value (``physics_loss
-    .iterations``); the off-graph reference ceiling below is always computed at
-    ``_REFERENCE_ITERATIONS`` (200), where autograd depth is irrelevant.
+    graph. The default of 60 is the train-config value
+    (``physics_loss.iterations``); the off-graph reference ceiling below is
+    always computed at ``_REFERENCE_ITERATIONS`` (200), where autograd depth
+    is irrelevant.
     """
     if x.dim() == 4:  # (B, D, H, W)
         x = x.unsqueeze(1)

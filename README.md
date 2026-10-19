@@ -42,15 +42,23 @@ Every run is reproducible from a single config file plus a fixed seed.
 ```sh
 # 1. Build the labeled dataset (FEA homogenization + HDF5 splits + manifest).
 #    Writes data/dataset_{train,val,test}.h5, data/manifest.parquet, data/data_card.md.
+#    The parameterized geometry run keeps its own checkpoint (dataset_v2), so
+#    it never overwrites an earlier run's checkpoint.
 micromamba run -n metamaterials python -m src.data.generate_dataset configs/dataset.yaml
 #    --mock-fea is pipeline testing ONLY (unphysical placeholder stiffness).
 
 # 2. Train the conditional DDPM (logs to W&B or TensorBoard).
+#    Defaults to configs/train_baseline.yaml + configs/model_baseline.yaml.
+#    On an 8 GB GPU use --train-config configs/train_4060.yaml, which differs
+#    only in batch_size (16 vs 32) and its logging-project name.
 micromamba run -n metamaterials python -m src.train
-#    Flags: --overfit N (10-sample architecture test), --max-iterations N,
-#           --resume-from <ckpt.pt>, --run-dir <dir>.
+#    Flags: --train-config, --model-config, --overfit N (10-sample architecture
+#           test), --max-iterations N, --resume-from <ckpt.pt>, --run-dir <dir>.
+#    Run the zero-physics ablation with --physics-ablation; the default config
+#    trains with Option B at lambda_1=0.05.
 
 # 3. Sample from held-out targets (CSV columns: E, relative_density, nu).
+#    The 50 held-out acceptance targets live in data/targets_test_50.csv.
 micromamba run -n metamaterials python -m src.sample \
     --checkpoint runs/<run>/ckpt.pt --targets targets.csv --export-stl
 

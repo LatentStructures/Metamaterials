@@ -30,8 +30,8 @@ multiple disconnected solid components. The proxy below is the differentiable
 relaxation of that binary connected-component check, applied to `p` instead of
 the thresholded grid.
 
-Surface an empty/isolated voxel, and treating zero values as a disconnected
-cluster, define the weighted 26-neighbourhood graph over grid nodes:
+Treating empty and isolated voxels as disconnected clusters, define the
+weighted 26-neighbourhood graph over the grid nodes:
 
 ```text
 A_ij = p_i * p_j          for all pairs (i, j) within the 26-neighbour cube
@@ -80,7 +80,7 @@ conditioning targets — that weakness is exactly what Option A (a frozen
 surrogate critic, contingency only) fixes.
 
 Reference implementation already exists for the *hard* version in
-`src/evaluate.compute_components` (binary 26-connected labeling); the two share
+`src/validation.compute_components` (binary 26-connected labeling); the two share
 the adjacency convention.
 
 ## Option A: frozen surrogate critic (contingency, out of baseline scope)
@@ -94,10 +94,11 @@ L_surrogate = w_E * ||E_sur(p) - E_tgt||^2 + w_rho * ||rho_sur(p) - rho_tgt||^2
               + w_nu * ||nu_sur(p) - nu_tgt||^2
 ```
 
-Grid it under `physics_loss.option: A` if it is ever implemented.
+Gate it under `physics_loss.option: A` if it is ever implemented.
 
 ## Ablation contract (Phase 2, Section 4.4)
 
 Train the pair `{lambda_1: 0}` vs `{lambda_1: 0.05}` (config keys under
-`physics_loss.ablation`) and log both to W&B under `tag: abl_physics`; the
-default `0.05` value is only a starting point, to be tuned during the ablation.
+`physics_loss.ablation`) and log both under the `abl_physics` tag (W&B tags,
+or the run's TensorBoard project); the default `0.05` value is only a starting
+point, to be tuned during the ablation.

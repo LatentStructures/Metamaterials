@@ -1,8 +1,12 @@
 # Phase 1 dataset generation config (see ROADMAP.md Phase 1).
 # Every run must be reproducible from this file alone with a fixed seed (Section 5).
 seed: 0
+checkpoint_name: dataset_v2                      # new geometry parameterization; preserves the legacy checkpoint untouched
 resolution: 32                                   # fixed 32³ for the whole baseline
-num_cells: 200                                   # 200 per family = 600 total cells
+num_cells: 800                                   # 800 per family = 2,400 total (ROADMAP 3.1: 2,000-5,000; 3.5 DoD: >=2,000)
+min_total_cells: 2000                            # refuse to publish a run below the baseline minimum after FEA failures
+num_test_targets: 50                             # write 50 distinct held-out property vectors for the acceptance run
+test_targets: data/targets_test_50.csv
 base_material:                                   # solid-phase props; E is a scale factor for homogenized C (Phase 1, Section 3.1)
   E: 1.0
   nu: 0.3
@@ -11,6 +15,10 @@ families:                                        # exactly these three (Phase 1,
   - octet_truss
   - gyroid
 relative_density_range: [0.1, 0.6]               # target band for sampling (Phase 1, Section 3.1)
+shape_parameter_ranges:                          # second independent continuous geometry knob, in addition to density
+  cubic_strut: [1.0, 2.5]                        # node radius / solved strut radius; preserves cubic symmetry
+  octet_truss: [1.0, 2.5]                        # FCC joint radius / solved strut radius
+  gyroid: [0.0, 0.08]                            # non-negative offset of the parallel gyroid level-set sheet
 splits:
   train: 0.8
   val: 0.1

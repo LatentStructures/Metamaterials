@@ -6,13 +6,14 @@ targets), re-homogenizes every generated grid with the **real** Phase 1 FEA
 solver, applies the synthesizability filter, and reports property
 reconstruction error on the validity-passing samples.
 
-Filter (own core, pluggable): if ``src.validation`` provides a filter, it is
-used preferentially; otherwise the built-in heuristic checks run:
+Synthesizability filter (owned by ``src.validation``, ROADMAP 4.6, step 4):
 
 * connectivity -- a single connected solid component (no floating voxels),
 * minimum wall thickness -- morphological opening rejects 1-voxel-thin walls,
 * overhang angle estimate -- approximate fraction of voxels lacking downward
   support (full support-structure analysis is out of baseline scope).
+
+Define ``filter_generated`` in ``src.validation`` to substitute a custom filter.
 
 ``--no-filter`` reports on every sample regardless of validity (the report is
 labelled accordingly).
@@ -29,10 +30,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy import ndimage
 
 from src.config import CONDITIONING_ORDER, REPO_ROOT, load_yaml
 from src.fea.property_extraction import effective_properties
+from src.validation import evaluate_validity
 
 LOG = logging.getLogger(__name__)
 
@@ -52,58 +53,8 @@ def _safe_sample_name(name: str, source: str) -> str:
 # --------------------------------------------------------------------------- #
 # Synthesizability filter (ROADMAP 4.6, step 4)
 # --------------------------------------------------------------------------- #
-
-def compute_components(vol: np.ndarray) -> int:
-    """Number of 26-connected solid components (0 for an empty grid).
-
-    The 3x3x3 structuring element matches the adjacency convention used by the
-    Option-B physics proxy (``src/losses/physics_loss.py``), so the soft
-    connectivity signal and the hard validity filter agree on corner-touching
-    structures.
-    """
-    solid = np.asarray(vol, dtype=bool)
-    if not solid.any():
-        return 0
-    _, n = ndimage.label(solid, structure=np.ones((3, 3, 3), dtype=bool))
-    return int(n)
-
-
-def filter_connectivity(vol: np.ndarray) -> bool:
-    """True iff the solid phase is a single connected component."""
-    return compute_components(vol) == 1
-
-
-def thin_solid_voxels(vol: np.ndarray, min_wall: int = 2) -> float:
-    """Fraction of solid voxels removed by an opening with a ``min_wall`` cube.
-
-    A single opening strips features thinner than ``min_wall`` voxels, so a
-    nonzero fraction flags 1-voxel-thin walls.
-    """
-    solid = np.asarray(vol, dtype=bool)
-    if not solid.any():
-        return 0.0
-    structure = np.ones((min_wall,) * 3, dtype=bool)
-    opened = ndimage.binary_opening(solid, structure=structure)
-    return float(solid.sum() - opened.sum()) / float(solid.sum())
-
-
-def overhang_fraction(vol: np.ndarray) -> float:
-    """Approximate fraction of solid voxels lacking downward support.
-
-    A voxel at z>0 is "supported" if the 3x3 block directly beneath it
-    contains any solid.  The estimate ignores the build platform and is meant
-    as a coarse manufacturability heuristic only.
-    """
-    solid = np.asarray(vol, dtype=bool)
-    if not solid.any():
-        return 0.0
-    above = solid[:, :, 1:]
-    lower = solid[:, :, :-1]
-    support = ndimage.binary_dilation(
-        lower, structure=np.ones((3, 3, 1), dtype=bool))
-    unsupported = above & (~support)
-    return float(unsupported.sum()) / float((above | lower).sum())
-
+# The connectivity / wall-thickness / overhang checks live in ``src.validation``
+# (imported above).
 
 def _plugged_filter() -> object | None:
     """Optional external filter; returns ``None`` when absent."""
@@ -112,20 +63,6 @@ def _plugged_filter() -> object | None:
     except ImportError:
         return None
     return filter_generated
-
-
-def evaluate_validity(vol: np.ndarray, cfg: dict) -> tuple[bool, str]:
-    """Full synthesizability check; returns (valid, reason)."""
-    if compute_components(vol) != 1:
-        return False, "connectivity"
-    min_wall = int(cfg.get("min_wall_voxels", 2))
-    max_thin = float(cfg.get("max_thin_fraction", 0.05))
-    if thin_solid_voxels(vol, min_wall) > max_thin:
-        return False, "min_wall_thickness"
-    max_overhang = float(cfg.get("max_overhang_fraction", 1.0))
-    if overhang_fraction(vol) > max_overhang:
-        return False, "overhang"
-    return True, "ok"
 
 
 # --------------------------------------------------------------------------- #

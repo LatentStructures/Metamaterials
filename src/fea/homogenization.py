@@ -54,9 +54,9 @@ _VOID_SCALE = 1e-6
 
 # Linear solver for the condensed SPD system.  The direct sparse LU used in the
 # baseline prototype scales poorly on the 32^3 lattice (~1e5 kept dofs, minutes
-# per cell).  Voxel homogenization practice (Dong et al. 2018, ParFE/bone micro-
-# FE, FANS) solves with preconditioned CG: with a Jacobi diagonal the res-32
-# solve drops to ~1-2 s/cell (measured ~1.5 s vs >10 min for splu).
+# per cell).  Voxel-homogenization practice (Dong et al. 2018; ParFE, bone
+# micro-FE, FANS) solves with preconditioned CG: with a Jacobi diagonal the
+# res-32 solve drops to ~1-2 s/cell (measured ~1.5 s vs >10 min for splu).
 _LINEAR_SOLVER = "cg"
 _CG_RTOL = 1e-6
 _CG_MAXITER = 5000
@@ -148,7 +148,7 @@ class _Problem:
         assert len(np.unique(self.block)) == self.n**3, "lattice nodes must be distinct"
 
         # material per cell: centroid -> voxel id -> (mu, lam)
-        # voxels grids are numpy C-order arrays, so flat id = x*res^2 + y*res + z
+        # voxel grids are numpy C-order arrays, so flat id = x*res^2 + y*res + z
         # (grid axis 0 = physical x carries the slowest stride).
         gm = self.msh.geometry.dofmaps[0]
         centers = self.gx[gm].mean(axis=1)
@@ -158,10 +158,10 @@ class _Problem:
         self.lam = fem.Function(self.V0)
 
         # PBC master/slave via union-find over the lattice. The partner table
-        # comes from the single shared source of truth -- mesh_utils
-        # .periodic_pairing -- rather than a second private implementation, so
-        # the two can never drift. Pair ids are lattice (meshio point) ids, so
-        # the union graph over the lattice is exact.
+        # comes from the single shared source of truth -- periodic_pairing in
+        # src/geometry/mesh_utils.py -- rather than a second private
+        # implementation, so the two can never drift. Pair ids are lattice
+        # (meshio point) ids, so the union graph over the lattice is exact.
         from src.geometry import periodic_pairing
         pairing = periodic_pairing(meshio_mesh, res)
         parent = np.arange(self.n**3)

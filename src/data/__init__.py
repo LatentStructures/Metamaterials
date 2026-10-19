@@ -1,3 +1,4 @@
+"""Dataset generation, HDF5-backed loading, and cubic-symmetry augmentation."""
 from src.data.augment import (
     proper_rotations,
     random_rotation,

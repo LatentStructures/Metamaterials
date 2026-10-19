@@ -30,7 +30,7 @@ def load_yaml(path: str | Path) -> dict:
 def check_conditioning_order(config: dict) -> None:
     """Fail loudly if a config's ``conditioning_order`` contradicts the lock.
 
-    Acceppts the order either at the top level (``dataset.yaml``) or nested
+    Accepts the order either at the top level (``dataset.yaml``) or nested
     under ``data`` (the training configs). The two YAML keys exist purely as
     documentation of the locked invariant; this check turns a silent order swap
     into a hard error at launch time.
