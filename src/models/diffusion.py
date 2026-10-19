@@ -78,15 +78,16 @@ class GaussianDiffusion:
         device = next(model.parameters()).device
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
         x = torch.randn(shape, device=device, generator=gen)
-        ab = torch.cat([self.schedule.alpha_bar, torch.ones(1, device=device)])
-        step_list = list(range(self.T - 1, -1, -(self.T // steps)))
-        if step_list[-1] != 0:
-            step_list.append(0)
-        for i in range(len(step_list) - 1):
-            ti = step_list[i]
-            t_next = step_list[i + 1]
-            ab_t = ab[ti]
-            ab_prev = ab[t_next]
+        # Use exactly `steps` model evaluations and include the final transition
+        # from timestep 0 to clean x0 (alpha_bar_previous = 1).
+        step_list = torch.linspace(self.T - 1, 0, steps, device="cpu").round().long().tolist()
+        if len(set(step_list)) != steps:
+            raise ValueError(f"steps={steps} produced duplicate DDIM timesteps for T={self.T}")
+        alpha_bar = self.schedule.alpha_bar.to(device)
+        for i, ti in enumerate(step_list):
+            t_next = step_list[i + 1] if i + 1 < len(step_list) else -1
+            ab_t = alpha_bar[ti]
+            ab_prev = alpha_bar[t_next] if t_next >= 0 else torch.ones((), device=device)
             eps = model(x, torch.full((x.shape[0],), ti, device=device, dtype=torch.long), cond)
             x0 = (x - torch.sqrt(1.0 - ab_t)[None, None, None, None] * eps) / \
                  torch.sqrt(ab_t)[None, None, None, None]
@@ -96,12 +97,21 @@ class GaussianDiffusion:
                 torch.sqrt(1.0 - ab_t / ab_prev)
             x = torch.sqrt(ab_prev)[None, None, None, None] * x0 + \
                 torch.sqrt(1.0 - ab_prev - sigma ** 2)[None, None, None, None] * eps
-            if sigma > 0:
-                x = x + sigma * torch.randn_like(x, generator=gen)
+            if float(sigma) > 0.0:
+                x = x + sigma * torch.randn(x.shape, device=device, dtype=x.dtype,
+                                             generator=gen)
         return x
 
 
 def build_diffusion(cfg: dict, device: torch.device) -> GaussianDiffusion:
-    d = GaussianDiffusion(T=int(cfg["T"]))
+    schedule = cfg.get("beta_schedule", "linear")
+    if schedule != "linear":
+        raise ValueError(f"unsupported beta_schedule {schedule!r}; baseline uses linear")
+    noise_schedule = NoiseSchedule.linear(
+        T=int(cfg["T"]),
+        beta_start=float(cfg.get("beta_start", 1e-4)),
+        beta_end=float(cfg.get("beta_end", 0.02)),
+    )
+    d = GaussianDiffusion(schedule=noise_schedule)
     d.schedule.to(device)
     return d

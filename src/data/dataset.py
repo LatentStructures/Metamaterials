@@ -54,6 +54,16 @@ class MetamaterialDataset(Dataset):
         self.return_stiffness = return_stiffness
         self.dtype = dtype
         with h5py.File(self.path, "r") as h5:
+            if "/conditioning_order" not in h5:
+                raise ValueError(
+                    f"{self.path}: missing /conditioning_order; dataset order cannot be verified"
+                )
+            stored_order = [str(s, "utf-8") for s in h5["/conditioning_order"][...]]
+            if stored_order != CONDITIONING_ORDER:
+                raise ValueError(
+                    f"{self.path}: /conditioning_order {stored_order} != locked "
+                    f"{CONDITIONING_ORDER}"
+                )
             self.voxels = h5["/voxels"][...]
             self.cond = h5["/conditioning_vector"][...].astype(np.float32)
             self.has_stiffness = "/stiffness_tensor" in h5
@@ -122,12 +132,13 @@ def read_conditioning_stats(h5_path: str | Path) -> ConditioningStats:
                 f"{h5_path}: /conditioning_vector has shape {cvec.shape}; "
                 f"expected (N, {len(CONDITIONING_ORDER)}) per {CONDITIONING_ORDER}"
             )
-        if isinstance(h5.get("/conditioning_order"), h5py.Dataset):
-            stored = [str(s, "utf-8") for s in h5["/conditioning_order"][...]]
-            if stored != CONDITIONING_ORDER:
-                raise ValueError(
-                    f"{h5_path}: /conditioning_order {stored} != locked {CONDITIONING_ORDER}"
-                )
+        if "/conditioning_order" not in h5:
+            raise ValueError(f"{h5_path}: missing /conditioning_order")
+        stored = [str(s, "utf-8") for s in h5["/conditioning_order"][...]]
+        if stored != CONDITIONING_ORDER:
+            raise ValueError(
+                f"{h5_path}: /conditioning_order {stored} != locked {CONDITIONING_ORDER}"
+            )
         attrs = cvec.attrs
         try:
             mean = np.asarray(attrs["mean"], dtype=np.float32)

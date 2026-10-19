@@ -42,6 +42,8 @@ Every run is reproducible from a single config file plus a fixed seed.
 ```sh
 # 1. Build the labeled dataset (FEA homogenization + HDF5 splits + manifest).
 #    Writes data/dataset_{train,val,test}.h5, data/manifest.parquet, data/data_card.md.
+#    The parameterized geometry run uses its own checkpoint (dataset_v2) and
+#    leaves the legacy dataset checkpoint intact.
 micromamba run -n metamaterials python -m src.data.generate_dataset configs/dataset.yaml
 #    --mock-fea is pipeline testing ONLY (unphysical placeholder stiffness).
 
@@ -49,6 +51,8 @@ micromamba run -n metamaterials python -m src.data.generate_dataset configs/data
 micromamba run -n metamaterials python -m src.train
 #    Flags: --overfit N (10-sample architecture test), --max-iterations N,
 #           --resume-from <ckpt.pt>, --run-dir <dir>.
+#    Run the zero-physics ablation with --physics-ablation; the default config
+#    trains with Option B at lambda_1=0.05.
 
 # 3. Sample from held-out targets (CSV columns: E, relative_density, nu).
 micromamba run -n metamaterials python -m src.sample \
