@@ -50,14 +50,14 @@ class FiLMLayer(nn.Module):
     def __init__(self, channels: int, embed_dim: int):
         super().__init__()
         self.norm = nn.GroupNorm(min(32, channels), channels)
-        self.siLU = nn.SiLU()
+        self.silu = nn.SiLU()
         self.in_proj = nn.Conv3d(channels, channels, 3, padding=1, bias=False)
         self.film = nn.Linear(embed_dim, channels * 2)
         self.out_proj = nn.Conv3d(channels, channels, 3, padding=1, bias=False)
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
-        h = self.siLU(h)
+        h = self.silu(h)
         h = self.in_proj(h)
         gamma, beta = self.film(emb).chunk(2, dim=1)
         h = h * (1.0 + gamma[:, :, None, None, None]) + beta[:, :, None, None, None]
@@ -144,6 +144,7 @@ class UNet3D(nn.Module):
                  time_embed_dim: int,
                  conditioning_dim: int,
                  conditioning_embed_dim: int,
+                 attention_heads: int = 4,
                  attention_resolutions: list[int] | None = None):
         super().__init__()
         self.channels = channels
@@ -166,9 +167,9 @@ class UNet3D(nn.Module):
             c_in = c_out
             res = 32 // (2 ** i)
             if res in self.attn_resolutions:
-                self.downs.append(SelfAttention3D(c_out))
+                self.downs.append(SelfAttention3D(c_out, heads=attention_heads))
         # bottleneck self-attention at the lowest resolution (4^3 = 32//8)
-        self.bottleneck_attn = SelfAttention3D(c_in)
+        self.bottleneck_attn = SelfAttention3D(c_in, heads=attention_heads)
 
         # expansive stages (reversed)
         rev = list(reversed(channels))
@@ -177,7 +178,7 @@ class UNet3D(nn.Module):
         for i, c_out in enumerate(rev[1:], start=1):
             res = 32 // (2 ** (len(channels) - i))
             if res in self.attn_resolutions:
-                self.ups.append(SelfAttention3D(c_in))
+                self.ups.append(SelfAttention3D(c_in, heads=attention_heads))
             self.ups.append(ResBlockUp(c_in, c_out, emb_dim))
             c_in = c_out
         self.conv_out = nn.Conv3d(rev[-1], self.out_channels, 3, padding=1)
@@ -219,4 +220,5 @@ class UNet3D(nn.Module):
                    time_embed_dim=int(unet_cfg["time_embed_dim"]),
                    conditioning_dim=int(unet_cfg["conditioning_dim"]),
                    conditioning_embed_dim=int(unet_cfg["conditioning_embed_dim"]),
+                   attention_heads=int(unet_cfg.get("attention_heads", 4)),
                    attention_resolutions=res)

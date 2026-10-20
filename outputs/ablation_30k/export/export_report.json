@@ -1,0 +1,9 @@
+{
+  "top_n": 5,
+  "tiles": 2,
+  "requested": 5,
+  "exported": 5,
+  "watertight": 5,
+  "failed": 0,
+  "watertightness_expected": "--tiles 2 pads the tiled block with void, so every exported surface is closed; a non-watertight file here is a real failure"
+}

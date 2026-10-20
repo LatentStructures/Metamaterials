@@ -89,43 +89,56 @@ See the acceptance criteria and lock-in checklist in Section 7 before branching 
 ```text
 Metamaterials/
 ├── environment.yml
-├── README.md
-├── ROADMAP.md
+├── README.md                      # setup + command reference
+├── ROADMAP.md                     # this file (binding spec)
+├── PROJECT.md                     # canonical write-up: design, results, caveats
+├── RuntheBaseline.md              # end-to-end runbook
+
 ├── configs/
 │   ├── dataset.yaml
 │   ├── model_baseline.yaml
-│   └── train_baseline.yaml
-├── data/                          # raw + processed voxel datasets (gitignored; use DVC or a data manifest)
+│   ├── train_baseline.yaml
+│   └── evaluate.yaml
+├── data/                          # voxel datasets (binaries gitignored; manifest + data card tracked)
+│   ├── manifest.parquet           # tracked (via .gitignore negation)
+│   ├── data_card.md               # tracked
+│   └── dataset_{train,val,test}.h5  # gitignored; version with DVC or equivalent
 ├── src/
+│   ├── config.py                  # config loading + check_conditioning_order()
+│   ├── voigt.py                   # the single Voigt index convention
 │   ├── geometry/                  # unit-cell generators, voxelization utils
 │   │   ├── lattice_families.py    # parametric unit cell generators
 │   │   ├── voxelize.py            # implicit function -> voxel grid
 │   │   └── mesh_utils.py          # voxel -> surface -> tet mesh
-│   ├── fea/                       # FEniCS/PyVista homogenization scripts
+│   ├── fea/                       # FEniCSx homogenization
 │   │   ├── homogenization.py      # periodic BC + stiffness tensor extraction
 │   │   ├── benchmarks.py          # analytical validation cases
 │   │   └── property_extraction.py # C_ijkl -> E, nu, G
 │   ├── data/
-│   │   ├── generate_dataset.py    # end-to-end dataset build script (batch + checkpointing)
+│   │   ├── generate_dataset.py    # end-to-end dataset build (batch + checkpointing)
 │   │   ├── dataset.py             # PyTorch Dataset/DataLoader, HDF5-backed
-│   │   └── augment.py             # cubic symmetry augmentation
+│   │   ├── augment.py             # cubic (24 proper rotation) symmetry augmentation
+│   │   └── build_synthetic_targets.py  # off-manifold control target set
 │   ├── models/
 │   │   ├── unet3d.py              # conditional 3D U-Net
 │   │   └── diffusion.py           # DDPM/DDIM process, noise schedule
 │   ├── losses/
-│   │   ├── physics_loss.py        # connectivity/proxy/neural-surrogate physics terms
+│   │   ├── physics_loss.py        # Option B connectivity proxy (+ Option A stub)
 │   │   └── README.md              # exact functional form of L_mechanics
-│   ├── validation/                # synthesizability filter, connectivity checks
+│   ├── validation/                # synthesizability filter, periodic connectivity checks
 │   ├── export/
-│   │   └── export_stl.py          # STL/3MF export
+│   │   └── export_stl.py          # STL export
 │   ├── train.py
 │   ├── sample.py
 │   └── evaluate.py                # FEA-verified evaluation + synthesizability filter
-├── tests/
-│   ├── test_homogenization.py     # against analytical benchmarks
-│   └── test_dataset.py
-└── notebooks/                     # exploration only, nothing load-bearing lives here
+└── tests/                         # pytest suite (136 cases) + smoke_test.py (env DoD)
+    ├── smoke_test.py              # FEniCSx solid-cube homogenization; run directly
+    ├── test_homogenization.py     # against analytical benchmarks
+    └── test_{dataset,geometry,models,losses,validation,export,configs,sample,train,...}.py
 ```
+
+> The runtime artifacts (`runs/`, `outputs/`) are produced by the pipeline and are
+> gitignored; each headline output directory carries a `README.md` cite-map.
 
 ---
 
@@ -219,6 +232,7 @@ This is the technical core of Phase 1. Get it right and validated before scaling
 Running a full FEA solve inside the training loop, every step, is computationally prohibitive. For the baseline, implement a **lightweight differentiable proxy** rather than the true PDE residual:
 
 - **Option B (BASELINE, implement this):** a differentiable connectivity/force-equilibrium proxy computed on the (soft, pre-threshold) voxel occupancy, e.g., a soft penalty on isolated/floating voxel clusters via a differentiable relaxation of connected-component labeling, which discourages obviously unphysical structures without requiring a full elasticity solve. It is the cheapest defensible choice: no extra model to pretrain, no surrogate-bias risk, and it reuses the connected-component logic already needed for the synthesizability filter (Phase 2, Section 4.6). It protects the validity-rate target but does not steer properties toward the conditioning targets, and that weakness is exactly what Option A fixes.
+  - **Post-baseline result (2026-10-20) — the validity-protection prediction was NOT confirmed.** The λ₁ = 0 ablation matched or beat physics-on on every metric measured (validity 94.0% vs 92.0%, better E/ρ/ν errors and R², 3.6× lower loss; `PROJECT.md` §8). Read the sentence above as design intent, not measured outcome; the ablation is a §7.2 review item. This spec only requires the ablation be **documented**, so the baseline obligation is met; interpretations beyond that (Option B broken, λ mis-tuned, premise wrong) are research-track hypotheses — see the scoping framing in `PROJECT.md` §8.
 - **Option A (stronger fidelity; contingency, not baseline scope):** if reconstruction-error/R² targets aren't being met, train a small neural surrogate (a simple 3D CNN regressor on the Phase 1 dataset predicting [E, ρ, ν] from a voxel grid; this takes a day, not a week) and use it as a frozen differentiable critic during diffusion training to penalize the denoised x₀ prediction's surrogate-predicted properties against the conditioning target.
 
 **L_total = L_diffusion + λ₁ · L_physics_proxy**, with λ₁ warmed up from 0 over the first ~20% of training (let the model learn basic geometric structure before physics constraints kick in).
@@ -232,6 +246,7 @@ Running a full FEA solve inside the training loop, every step, is computationall
 ### 4.5 Training Loop
 
 - Optimizer: AdamW, lr 1e-4, cosine decay, EMA of weights (decay 0.9999).
+  - **Post-baseline note (2026-10-20):** at `decay 0.9999` over a 30k cosine-annealed run the EMA shadow is a 10k-step average centred ~step 25k — *before* the LR reaches 0 — so it samples a less-converged model and emits fragmented (invalid) grids (**14% vs 92%** validity). The sampler therefore defaults to `--weights live`. Root cause and the interpolation dose–response are in `PROJECT.md` §8. A shorter decay (~0.999) would fix it; validating that is research-track.
 - Batch size: 32³ volumes are small, so batch sizes of 32–64 should fit comfortably on a 24GB GPU.
 - Mixed precision (bf16 preferred if your GPU supports it).
 - Checkpoint every N steps; log loss curves and rendered sample voxel grids (via PyVista) to W&B every eval interval, because sample quality matters as much as loss numbers.

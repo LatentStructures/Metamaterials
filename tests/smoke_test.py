@@ -6,22 +6,29 @@
 # homogenization (PBC/MPC + 6 load cases + benchmark validation) is the Phase-1
 # milestone in src/fea/ (Section 3.3). A fully solid, isotropic cube under a prescribed
 # affine axial strain must return C1111 within tolerance of the closed form:
-#   C1111 = λ + 2μ = E (1 − ν) / ((1 + ν)(1 − 2ν))
+#   C1111 = lambda + 2*mu = E (1 - nu) / ((1 + nu) (1 - 2 nu))
 #
 # Run:  `micromamba run -n metamaterials python tests/smoke_test.py`
 
 import numpy as np
-import ufl
-from dolfinx import default_scalar_type, fem, mesh
-from dolfinx.fem.petsc import LinearProblem
-from mpi4py import MPI
 
+# FEniCSx imports are deliberately deferred into main(): pytest discovers this
+# file via the ``*_test.py`` pattern and imports it during ``pytest tests``
+# collection, so deferring means importing this module never pulls FEniCSx.
+# It contributes 0 test items either way -- run it directly as the env DoD.
+# (The rest of the suite does need dolfinx: the FEA benchmark tests import
+# src.fea. This deferral is hygiene, not what makes pytest dolfinx-free.)
 E = 70e9      # Young's modulus [Pa]
 NU = 0.33     # Poisson's ratio
 TOL = 1e-4    # relative tolerance vs closed form (affine field is exact; this is generous)
 
 
 def main() -> None:
+    import ufl
+    from dolfinx import default_scalar_type, fem, mesh
+    from dolfinx.fem.petsc import LinearProblem
+    from mpi4py import MPI
+
     # 1) Generate one voxel cube (the Phase 1 representation): an all-solid
     #    binary occupancy grid (16^3 here for speed; the dataset uses 32^3).
     res = 16

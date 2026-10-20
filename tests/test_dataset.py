@@ -108,3 +108,25 @@ def test_reader_rejects_wrong_conditioning_width(tmp_path):
         f["/conditioning_vector"].attrs["name"] = "test"
     with pytest.raises(ValueError):
         read_conditioning_stats(path)
+
+
+def test_dataset_rejects_conditioning_order_mismatch(tmp_path):
+    path = tmp_path / "wrong_order.h5"
+    voxels = np.zeros((2, 4, 4, 4), dtype=np.uint8)
+    cond = np.zeros((2, 3), dtype=np.float32)
+    with h5py.File(path, "w") as h5:
+        h5.create_dataset("/voxels", data=voxels)
+        h5.create_dataset("/conditioning_vector", data=cond)
+        h5.create_dataset("/conditioning_order", data=np.asarray(
+            [b"relative_density", b"E", b"nu"]))
+    with pytest.raises(ValueError, match="conditioning_order"):
+        MetamaterialDataset(path)
+
+
+def test_dataset_rejects_missing_conditioning_order(tmp_path):
+    path = tmp_path / "missing_order.h5"
+    with h5py.File(path, "w") as h5:
+        h5.create_dataset("/voxels", data=np.zeros((2, 4, 4, 4), dtype=np.uint8))
+        h5.create_dataset("/conditioning_vector", data=np.zeros((2, 3), dtype=np.float32))
+    with pytest.raises(ValueError, match="missing /conditioning_order"):
+        MetamaterialDataset(path)

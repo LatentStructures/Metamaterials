@@ -1,34 +1,90 @@
-# --- Dataset binaries (HDF5, npz). Keep Parquet/CSV manifests in git (§3.4) ---
+# Ignore rules for the metamaterial diffusion baseline (ROADMAP.md section 5).
+#
+# Generated binaries (datasets, checkpoints, run artifacts) are not committed;
+# the Parquet/CSV manifests and dataset card stay in git to reproduce a run.
+#
+# Keep comments on their own line: git does not support inline comments, so any
+# "#..." after a pattern becomes part of that pattern.
+
+# --- Generated datasets (keep the manifests, drop the binary payload) ---
 data/*
 !data/*.csv
 !data/*.parquet
+!data/*.md
 !data/README*
 !data/.gitkeep
+data/checkpoints/
 
-# --- Local conda/micromamba env & cache (repo-local, see README) ---
+# --- Generated HDF5 / NumPy / mesh binaries anywhere in the tree ---
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.stl
+
+# --- Training and evaluation artifacts ---
+runs/
+outputs/
+wandb/
+*.pt
+*.ckpt
+events.out.tfevents.*
+
+# --- Selectively tracked results (override the blanket `outputs/` rule above) ---
+# Commit the three headline result dirs + the flagged stale report; keep
+# `outputs/samples/` (pre-fix scratch) and `runs/` (186 MB checkpoints, over
+# GitHub's 100 MB limit) ignored.
+# A file cannot be re-included while an ancestor is excluded, so un-ignore the
+# `outputs/` dir first, then re-include per file type (later rules win).
+!outputs/
+outputs/*
+!outputs/README.md
+!outputs/acceptance_30k/
+!outputs/ablation_30k/
+!outputs/synthetic_30k/
+!outputs/evaluate/
+outputs/samples/
+outputs/diag/
+
+# Do NOT use `!outputs/<dir>/**`: it re-includes every type, leaking the `.npy`
+# grids back in. Un-ignore per type instead so the `*.npy` rule above holds.
+!outputs/**/*.stl
+!outputs/**/*.png
+!outputs/**/*.csv
+!outputs/**/*.json
+!outputs/**/*.md
+
+# --- Local environments (repo-local micromamba prefix; see README) ---
 .mamba/
+.conda/
+.venv/
+venv/
+env/
 bin/
 
-# --- Python ---
+# --- Python build and tool caches ---
 __pycache__/
 *.py[cod]
 *.egg-info/
-.venv/
+build/
+dist/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .ipynb_checkpoints/
 
-# --- Training artifacts ---
-runs/
-checkpoints/
-*.pt
-*.ckpt
-wandb/
-
-# --- DVC internals ---
-.dvc/
+# --- DVC internals (keep .dvc/config itself tracked if DVC is adopted) ---
 .dvc/cache/
+.dvc/tmp/
+.dvc/config.local
 
-# --- OS ---
+# --- Secrets and logs ---
+.env
+*.log
+
+# --- Editors and OS files ---
 .DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

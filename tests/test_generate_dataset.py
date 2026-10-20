@@ -55,7 +55,7 @@ def _write_tiny_config(tmp_path: pytest.TempPathFactory) -> str:
         "fea_retries": 1,
     }
     path = tmp_path / "tiny.yaml"
-    with open(path, "w", encoding="utf-8") as fh:
+    with path.open("w", encoding="utf-8") as fh:
         yaml.safe_dump(cfg, fh)
     return str(path)
 
@@ -88,6 +88,53 @@ def test_stratify_splits_bucket_allocation():
     assert len(splits["train"]) == 96
     assert len(splits["val"]) == 12
     assert len(splits["test"]) == 12
+
+
+def test_stratify_keeps_identical_grids_in_one_split():
+    unique = [np.full((2, 2, 2), i, dtype=np.uint8) for i in range(9)]
+    samples = [{"family": "gyroid", "achieved_density": 0.3, "voxels": grid}
+               for grid in unique]
+    samples.insert(3, {"family": "gyroid", "achieved_density": 0.3,
+                       "voxels": unique[0].copy()})
+    splits = gen._stratify_splits(
+        samples, {"train": 0.8, "val": 0.1, "test": 0.1}, (0.1, 0.6),
+        np.random.default_rng(0))
+    assignments = {i: split for split, indexes in splits.items() for i in indexes}
+    assert assignments[0] == assignments[3]
+    assert gen._check_cross_split_leakage(samples, splits) == 0
+
+
+def test_unique_test_conditions_requires_distinct_vectors_and_is_seeded():
+    records = [{"cond": np.asarray([float(i), 0.25, 0.3], dtype=np.float32)}
+               for i in range(4)]
+    first = gen._unique_test_conditions(records, [0, 1, 2, 3], 3, seed=9)
+    second = gen._unique_test_conditions(records, [0, 1, 2, 3], 3, seed=9)
+    assert np.array_equal(first, second)
+    assert len(np.unique(first, axis=0)) == 3
+    with pytest.raises(RuntimeError, match="distinct conditioning vectors"):
+        gen._unique_test_conditions(records, [0, 0, 1], 3, seed=9)
+
+
+def test_grouped_split_keeps_row_fractions_while_preventing_leakage():
+    grids = [np.full((2, 2, 2), i, dtype=np.uint8) for i in range(20)]
+    samples = [{"family": "cubic_strut", "achieved_density": 0.3,
+                "voxels": grid} for grid in grids]
+    samples.extend([
+        {"family": "cubic_strut", "achieved_density": 0.3,
+         "voxels": grids[0].copy()} for _ in range(3)
+    ])
+    samples.extend([
+        {"family": "cubic_strut", "achieved_density": 0.3,
+         "voxels": grids[1].copy()} for _ in range(2)
+    ])
+    splits = gen._stratify_splits(
+        samples, {"train": 0.8, "val": 0.1, "test": 0.1}, (0.1, 0.6),
+        np.random.default_rng(4))
+    assert gen._check_cross_split_leakage(samples, splits) == 0
+    sizes = {k: len(v) / len(samples) for k, v in splits.items()}
+    assert 0.65 <= sizes["train"] <= 0.9
+    assert 0.05 <= sizes["val"] <= 0.2
+    assert 0.05 <= sizes["test"] <= 0.2
 
 
 # --------------------------------------------------------------------------- #

@@ -9,6 +9,7 @@ checkpointed every ``checkpoint_every`` cells and resumes automatically.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import multiprocessing
 import os
@@ -37,9 +38,9 @@ from src.geometry import (
 
 LOG = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # FEA interface
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 
 
 def _write_validation_table(summary: dict) -> None:
@@ -82,7 +83,7 @@ def _load_homogenizer(mock_fea: bool, validation_tolerance: float, res: int,
             raise SystemExit(
                 "src/fea/homogenization.py is not available.  "
                 "Run inside the conda env where dolfinx is installed."
-            )
+            ) from None
         LOG.warning(
             "Using --mock-fea: stiffness is UNPHYSICAL. "
             "Do NOT commit mock data to production."
@@ -111,9 +112,9 @@ class _MockHomogenizer:
         return C6
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # Sampling helpers
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 
 def _sample_all(config: dict, rng: np.random.Generator) -> list[dict]:
     """Per-cell target specs (family + target density), in canonical order.
@@ -131,46 +132,74 @@ def _sample_all(config: dict, rng: np.random.Generator) -> list[dict]:
     cells_per_family[-1] += num_total - sum(cells_per_family)
 
     samples = []
-    for family, n in zip(families, cells_per_family):
+    shape_ranges = config.get("shape_parameter_ranges", {})
+    for family, n in zip(families, cells_per_family, strict=True):
         for _ in range(n):
             target_rho = rng.uniform(density_lo, density_hi)
-            samples.append({
+            sample = {
                 "family": family,
                 "target_density": target_rho,
-            })
+            }
+            if family in shape_ranges:
+                low, high = shape_ranges[family]
+                sample["shape_parameter"] = float(rng.uniform(low, high))
+            samples.append(sample)
     return samples
 
 
 def _stratify_splits(samples: list[dict], frac: dict[str, float],
                      density_range: tuple[float, float],
                      rng: np.random.Generator) -> dict[str, list[int]]:
-    """Split sample indices 80/10/10 stratified by (family, density bucket)."""
-    buckets: dict[tuple[str, int], list[int]] = {}
+    """Stratify by family/density while keeping identical voxel grids together."""
+    groups: dict[bytes, list[int]] = {}
+    for i, sample in enumerate(samples):
+        voxels = sample.get("voxels")
+        # Before FEA, samples have no grids yet. In that case each requested
+        # design remains its own group; generation calls this after grids exist.
+        key = (np.ascontiguousarray(voxels).tobytes()
+               if voxels is not None else f"sample:{i}".encode())
+        groups.setdefault(key, []).append(i)
+
+    buckets: dict[tuple[str, int], list[bytes]] = {}
     n_buckets = 5
     density_lo, density_hi = density_range
-    for i, s in enumerate(samples):
-        b = min(int((s["achieved_density"] - density_lo) / (density_hi - density_lo) * n_buckets),
+    for key, indexes in groups.items():
+        # Identical grids can arise across parameter samples (and occasionally
+        # across family labels). Use a deterministic representative for the
+        # stratum, but assign every member of the group to the same split.
+        s = samples[indexes[0]]
+        rho = float(s.get("achieved_density", s.get("target_density")))
+        b = min(int((rho - density_lo) / (density_hi - density_lo) * n_buckets),
                 n_buckets - 1)
-        key = (s["family"], b)
-        buckets.setdefault(key, []).append(i)
+        buckets.setdefault((s["family"], b), []).append(key)
 
     result: dict[str, list[int]] = {k: [] for k in frac}
-    for idxs in buckets.values():
-        rng.shuffle(idxs)
-        total = len(idxs)
-        if total < 3:  # too small to split usefully: keep the whole bucket in train
-            result["train"].extend(idxs)
+    for group_keys in buckets.values():
+        rng.shuffle(group_keys)
+        if len(group_keys) < len(frac):
+            # Too few independent designs to populate every split without
+            # leakage; keep this stratum in train and let the target-count gate
+            # below reject an underpowered held-out set.
+            result["train"].extend(i for key in group_keys for i in groups[key])
             continue
-        n_test = max(1, round(total * frac.get("test", 0.1)))
-        n_val = max(1, round(total * frac.get("val", 0.1)))
-        n_train = max(1, total - n_test - n_val)
-        # keep at least one cell per split even if the fractions round otherwise
-        n_test = min(n_test, total - n_train - 1)
-        n_val = min(n_val, total - n_train - n_test)
-        n_train = total - n_test - n_val
-        result["train"].extend(idxs[:n_train])
-        result["val"].extend(idxs[n_train:n_train + n_val])
-        result["test"].extend(idxs[n_train + n_val:])
+        row_total = sum(len(groups[key]) for key in group_keys)
+        targets = {split: row_total * weight for split, weight in frac.items()}
+        assigned = dict.fromkeys(frac, 0)
+        # Place large duplicate groups first, balancing by number of records
+        # while keeping each exact geometry wholly within one split.
+        ordered = sorted(group_keys, key=lambda key: len(groups[key]), reverse=True)
+        for pos, key in enumerate(ordered):
+            empty = [split for split in frac if assigned[split] == 0]
+            remaining = len(ordered) - pos
+            if empty and remaining <= len(empty):
+                split = max(empty, key=lambda name: targets[name])
+            else:
+                split = max(
+                    frac,
+                    key=lambda name: targets[name] - assigned[name],
+                )
+            result[split].extend(groups[key])
+            assigned[split] += len(groups[key])
     for idxs in result.values():
         rng.shuffle(idxs)
     return result
@@ -199,9 +228,26 @@ def _check_cross_split_leakage(records: list[dict], splits: dict[str, list[int]]
     return leakages
 
 
-# ---------------------------------------------------------------------------
+def _unique_test_conditions(records: list[dict], test_indices: list[int],
+                            count: int, seed: int) -> np.ndarray:
+    """Choose distinct raw [E, relative_density, nu] targets from the test split."""
+    by_condition: dict[tuple[float, ...], np.ndarray] = {}
+    for i in test_indices:
+        c = np.asarray(records[i]["cond"], dtype=np.float32)
+        by_condition.setdefault(tuple(float(v) for v in c), c)
+    if len(by_condition) < count:
+        raise RuntimeError(
+            f"test split has only {len(by_condition)} distinct conditioning vectors; "
+            f"need {count} for the configured held-out acceptance targets"
+        )
+    values = list(by_condition.values())
+    selected = np.random.default_rng(seed).choice(len(values), size=count, replace=False)
+    return np.stack([values[int(i)] for i in selected])
+
+
+# --------------------------------------------------------------------------- #
 # Worker functions (multiprocess FEA path)
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 
 _WKOPTS: dict = {}
 
@@ -214,6 +260,10 @@ def _init_worker(opts: dict) -> None:
     with unlimited OpenBLAS threads thrash instead of scale).
     """
     threads = max(1, int(opts.get("omp_threads", 1)))
+    # NOTE: spawned children re-import this module (and numpy/torch) before the
+    # initializer runs, so these vars only bind to libraries loaded *after* this
+    # point -- dolfinx/PETSc/scipy, imported just below, which are the heavy
+    # consumers anyway. OpenBLAS/torch already loaded in the child are unaffected.
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ[var] = str(threads)
     from src.fea import set_base_material, set_void_scale
@@ -244,7 +294,8 @@ def _build_mesh_and_pairings(res: int) -> tuple:
 
 def _homogenize_with_retry(family: str, target_rho: float, res: int,
                            homogenizer, mesh, pairings: dict,
-                           max_attempts: int, seed: int, index: int
+                           max_attempts: int, seed: int, index: int,
+                           shape_parameter: float = 1.0
                            ) -> tuple[np.ndarray, np.ndarray, float]:
     """Rasterize + homogenize one cell, retrying with a density jitter on failure.
 
@@ -252,7 +303,8 @@ def _homogenize_with_retry(family: str, target_rho: float, res: int,
     actually solved (a jitter retry may have regenerated the geometry). Raises
     ``RuntimeError`` after ``max_attempts``.
     """
-    grid, _ = sample_for_density(family, target_rho, res)
+    grid, _ = sample_for_density(family, target_rho, res,
+                                 shape_parameter=shape_parameter)
     for attempt in range(max_attempts):
         try:
             C6 = homogenizer(grid, mesh, pairings, res)
@@ -267,7 +319,8 @@ def _homogenize_with_retry(family: str, target_rho: float, res: int,
             jitter = float(np.random.default_rng(
                 seed + index + attempt).uniform(-2e-2, 2e-2))
             target = min(0.999, max(1e-3, target_rho + jitter))
-            grid, _ = sample_for_density(family, target, res)
+            grid, _ = sample_for_density(family, target, res,
+                                         shape_parameter=shape_parameter)
     raise RuntimeError(
         f"sample {index} ({family}) permanently failed after {max_attempts} attempts"
     )
@@ -284,7 +337,8 @@ def _process_cell(i: int, s: dict) -> dict:
     C6, grid, t = _homogenize_with_retry(
         s["family"], float(s["target_density"]), opts["res"],
         opts["homogenizer"], opts["mesh"], opts["pairings"],
-        opts["max_attempts"], opts["seed"], i)
+        opts["max_attempts"], opts["seed"], i,
+        float(s.get("shape_parameter", 1.0)))
     return {"C6": C6, "fea_time_s": t, "voxels": grid}
 
 
@@ -311,9 +365,9 @@ def _assemble_record(i: int, s: dict, C6: np.ndarray, fea_time_s: float,
     return rec
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # Checkpoint helpers
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 
 def _load_checkpoint(path: Path) -> list[dict]:
     if not path.exists():
@@ -336,11 +390,14 @@ def _load_checkpoint(path: Path) -> list[dict]:
         C6 = np.zeros((6, 6), dtype=np.float32)
         if c6_cols:
             C6.flat[:] = row[c6_cols].to_numpy(dtype=np.float32)
+        # None for legacy checkpoints (which predate the column); the resume
+        # path in main() backfills it from the voxel file name before saving.
         sample_index = int(row["sample_index"]) if "sample_index" in df.columns else None
         out.append({
             "family": row["family"],
             "achieved_density": float(row["achieved_density"]),
             "target_density": float(row["target_density"]),
+            "shape_parameter": float(row.get("shape_parameter", 1.0)),
             "E_eff": float(row["E_eff"]) if "E_eff" in df.columns else float(row.get("cond_E", np.nan)),
             "nu_eff": float(row["nu_eff"]) if "nu_eff" in df.columns else float(row.get("cond_nu", np.nan)),
             "voxel_path": Path(str(row["voxel_path"])),
@@ -361,6 +418,7 @@ def _save_checkpoint(records: list[dict], path: Path) -> None:
             "family": r["family"],
             "achieved_density": r["achieved_density"],
             "target_density": r["target_density"],
+            "shape_parameter": float(r.get("shape_parameter", 1.0)),
             "E_eff": float(r.get("E_eff", c[CONDITIONING_ORDER.index("E")])),
             "nu_eff": float(r.get("nu_eff", c[CONDITIONING_ORDER.index("nu")])),
             "voxel_path": str(r.get("voxel_path", "")),
@@ -378,9 +436,9 @@ def _save_checkpoint(records: list[dict], path: Path) -> None:
     df.to_parquet(path, index=False)
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # Main
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 
 def _run_parallel(records: list[dict], pending: list[tuple[int, dict]],
                   n_workers: int, max_attempts: int, seed: int, res: int,
@@ -456,7 +514,8 @@ def generate(config_path: str | Path, mock_fea: bool = False,
 
     checkpoint_every = config.get("checkpoint_every", 100)
     ckpt_dir = REPO_ROOT / "data" / "checkpoints"
-    ckpt_file = ckpt_dir / f"ckpt_{Path(config_path).stem}_s{seed}.parquet"
+    checkpoint_name = str(config.get("checkpoint_name", Path(config_path).stem))
+    ckpt_file = ckpt_dir / f"ckpt_{checkpoint_name}_s{seed}.parquet"
 
     existing = _load_checkpoint(ckpt_file)
     voxdir = ckpt_dir / "vox"
@@ -480,6 +539,9 @@ def generate(config_path: str | Path, mock_fea: bool = False,
         idx = s.get("sample_index")
         if idx is None:  # legacy checkpoint: recover the sample index from the file name
             idx = int(Path(s["voxel_path"]).stem.rsplit("_", 1)[1])
+            # Backfill: without this the key stays None and _save_checkpoint
+            # (int(None)) / the records.sort below both raise TypeError.
+            s["sample_index"] = idx
         done.add(idx)
 
     max_attempts = int(config.get("fea_retries", 3))
@@ -502,7 +564,8 @@ def generate(config_path: str | Path, mock_fea: bool = False,
             try:
                 C6, grid, fea_time = _homogenize_with_retry(
                     s["family"], float(s["target_density"]), res, homogenizer,
-                    mesh, pairings, max_attempts, seed, i)
+                    mesh, pairings, max_attempts, seed, i,
+                    float(s.get("shape_parameter", 1.0)))
                 rec = _assemble_record(i, s, C6, fea_time, voxdir, grid)
             except (RuntimeError, ValueError) as exc:
                 failed += 1
@@ -532,6 +595,12 @@ def generate(config_path: str | Path, mock_fea: bool = False,
             "no cells were successfully homogenized; refusing to write empty "
             "HDF5 splits and a manifest"
         )
+    min_total = int(config.get("min_total_cells", 0))
+    if len(records) < min_total:
+        raise RuntimeError(
+            f"only {len(records)} cells passed FEA; config requires at least "
+            f"{min_total} before publishing the dataset"
+        )
 
     splits = _stratify_splits(records, config["splits"],
                               config["relative_density_range"],
@@ -540,7 +609,16 @@ def generate(config_path: str | Path, mock_fea: bool = False,
     if leakages == 0:
         LOG.info("cross-split duplicate check: 0 duplicate pairs across splits")
     else:
-        LOG.warning("cross-split duplicate check: %d duplicate pairs detected", leakages)
+        raise RuntimeError(
+            f"found {leakages} exact duplicate voxel grids across dataset splits; "
+            "refusing to write a leaked train/validation/test dataset"
+        )
+
+    target_count = int(config.get("num_test_targets", 0))
+    test_conditions = None
+    if target_count:
+        test_conditions = _unique_test_conditions(
+            records, splits.get("test", []), target_count, seed + 2)
 
     all_conds = np.stack([r["cond"] for r in records])
     train_conds = all_conds[splits["train"]]
@@ -555,6 +633,7 @@ def generate(config_path: str | Path, mock_fea: bool = False,
     meta_dtype = np.dtype([
         ("family", "S16"),
         ("target_density", "f4"),
+        ("shape_parameter", "f4"),
         ("achieved_density", "f4"),
         ("E_eff", "f4"),
         ("nu_eff", "f4"),
@@ -575,6 +654,7 @@ def generate(config_path: str | Path, mock_fea: bool = False,
             r = records[i]
             meta[k]["family"] = r["family"].encode("utf-8")
             meta[k]["target_density"] = float(r.get("target_density", np.nan))
+            meta[k]["shape_parameter"] = float(r.get("shape_parameter", 1.0))
             meta[k]["achieved_density"] = float(r["achieved_density"])
             meta[k]["E_eff"] = float(r.get("E_eff", r["cond"][CONDITIONING_ORDER.index("E")]))
             meta[k]["nu_eff"] = float(r.get("nu_eff", r["cond"][CONDITIONING_ORDER.index("nu")]))
@@ -594,6 +674,7 @@ def generate(config_path: str | Path, mock_fea: bool = False,
             "family": r["family"],
             "achieved_density": float(r["achieved_density"]),
             "target_density": float(r["target_density"]),
+            "shape_parameter": float(r.get("shape_parameter", 1.0)),
             "E_eff": float(r.get("E_eff", r["cond"][CONDITIONING_ORDER.index("E")])),
             "nu_eff": float(r.get("nu_eff", r["cond"][CONDITIONING_ORDER.index("nu")])),
             "fea_time_s": float(r.get("fea_time_s", np.nan)),
@@ -607,13 +688,67 @@ def generate(config_path: str | Path, mock_fea: bool = False,
     manifest.to_parquet(manifest_path, index=False)
     LOG.info("manifest written to %s", manifest_path)
 
+    if test_conditions is not None:
+        target_path = REPO_ROOT / config["test_targets"]
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(test_conditions, columns=CONDITIONING_ORDER).to_csv(
+            target_path, index=False)
+        LOG.info("wrote %d distinct held-out target vectors to %s",
+                 target_count, target_path)
+
+    validity_report = _validity_summary(manifest, records, config)
     _write_data_card(manifest, config, records, failed,
-                     void_scale, float(time.time() - t0), validation)
+                     void_scale, float(time.time() - t0), validation,
+                     validity_report)
+
+
+def _validity_summary(manifest: pd.DataFrame, records: list[dict],
+                      config: dict) -> dict | None:
+    """Periodic synthesizability rate over the dataset, for the data card.
+
+    Uses the same filter thresholds as the evaluation pipeline
+    (``configs/evaluate.yaml``) so the card cannot drift from the real filter.
+    Returns ``None`` if the voxels are unavailable (e.g. a resumed run whose
+    arrays are no longer in memory), in which case the card just omits the
+    section.
+    """
+    if not records or "voxels" not in records[0]:
+        return None
+    try:
+        from src.config import load_yaml
+        from src.validation import evaluate_validity
+
+        eval_cfg_path = REPO_ROOT / "configs" / "evaluate.yaml"
+        filter_cfg = load_yaml(eval_cfg_path) if eval_cfg_path.exists() else {}
+        rates: dict[str, dict] = {}
+        valid = 0
+        for r in records:
+            ok, _ = evaluate_validity(np.asarray(r["voxels"], dtype=bool), filter_cfg)
+            valid += int(ok)
+            fam = r["family"]
+            rates.setdefault(fam, {"valid": 0, "total": 0})
+            rates[fam]["valid"] += int(ok)
+            rates[fam]["total"] += 1
+        total = len(records)
+        return {
+            "rate": valid / total if total else 0.0,
+            "valid": valid,
+            "total": total,
+            "by_family": {
+                fam: {"rate": v["valid"] / v["total"] if v["total"] else 0.0,
+                      "valid": v["valid"], "total": v["total"]}
+                for fam, v in rates.items()
+            },
+        }
+    except Exception:  # card generation must never sink a completed dataset
+        LOG.warning("periodic validity summary unavailable", exc_info=True)
+        return None
 
 
 def _write_data_card(manifest: pd.DataFrame, config: dict, records: list[dict],
                      failed: int, void_scale: float, wall_s: float,
-                     validation: dict | None = None) -> None:
+                     validation: dict | None = None,
+                     validity_report: dict | None = None) -> None:
     """Write ``data/data_card.md`` summarising the generated dataset (ROADMAP 3.4)."""
     res = config["resolution"]
     e_eff = manifest["E_eff"].to_numpy()
@@ -632,10 +767,12 @@ def _write_data_card(manifest: pd.DataFrame, config: dict, records: list[dict],
         f"- **seed**: {config['seed']}",
         f"- **generation date**: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"- **total records**: {len(records)} (failed/skipped: {failed})",
+        f"- **unique voxel grids**: {len({hashlib.sha256(np.ascontiguousarray(r['voxels']).tobytes()).digest() for r in records})}",
         f"- **wall time (FEA)**: {wall_s:.1f}s",
         "",
         "## FEA configuration",
-        f"- base material: E={config['base_material']['E']}, nu={config['base_material']['nu']}",
+        f"- base material: E_s={config['base_material']['E']}, nu_s={config['base_material']['nu']}",
+        "- E_eff is in the same units as E_s; with E_s=1 it is the dimensionless ratio E_eff/E_s.",
         f"- void scale: {_f(void_scale)} (E_void = scale * E, nu_void = nu_base)",
         f"- validation tolerance: {config['homogenization']['validation_tolerance']}",
         "",
@@ -672,6 +809,27 @@ def _write_data_card(manifest: pd.DataFrame, config: dict, records: list[dict],
             lines.append(
                 f"| {name} | {_f(info['max_rel_err'])} | "
                 f"{'yes' if info['ok'] else 'no'} |"
+            )
+
+    # Periodic validity is a property of the *data*, not of one downstream run,
+    # so record it here. It is the fraction of cells that pass the
+    # synthesizability filter, and it must be computed with periodic
+    # connectivity: counting components in the unwrapped box undercounts badly
+    # (it read 50.8% on this dataset vs 87.7% correctly measured).
+    if validity_report is not None:
+        lines += [
+            "",
+            "## Periodic validity (synthesizability filter)",
+            (f"- overall: {validity_report['rate'] * 100:.1f}%"
+             f" ({validity_report['valid']}/{validity_report['total']})"),
+            "- connectivity is counted **periodically** (components merged across",
+            "  wrapped faces); the unwrapped count is far lower and is wrong for",
+            "  unit cells.",
+        ]
+        for family, info in sorted(validity_report["by_family"].items()):
+            lines.append(
+                f"- {family}: {info['rate'] * 100:.1f}%"
+                f" ({info['valid']}/{info['total']})"
             )
 
     path = REPO_ROOT / "data" / "data_card.md"

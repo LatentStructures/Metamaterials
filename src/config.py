@@ -23,14 +23,14 @@ of the conditioning vector.
 
 
 def load_yaml(path: str | Path) -> dict:
-    with open(path, "r", encoding="utf-8") as fh:
+    with Path(path).open(encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
 
 def check_conditioning_order(config: dict) -> None:
     """Fail loudly if a config's ``conditioning_order`` contradicts the lock.
 
-    Acceppts the order either at the top level (``dataset.yaml``) or nested
+    Accepts the order either at the top level (``dataset.yaml``) or nested
     under ``data`` (the training configs). The two YAML keys exist purely as
     documentation of the locked invariant; this check turns a silent order swap
     into a hard error at launch time.

@@ -6,13 +6,19 @@ targets), re-homogenizes every generated grid with the **real** Phase 1 FEA
 solver, applies the synthesizability filter, and reports property
 reconstruction error on the validity-passing samples.
 
-Filter (own core, pluggable): if ``src.validation`` provides a filter, it is
-used preferentially; otherwise the built-in heuristic checks run:
+Synthesizability filter (owned by ``src.validation``, ROADMAP 4.6, step 4):
 
-* connectivity -- a single connected solid component (no floating voxels),
-* minimum wall thickness -- morphological opening rejects 1-voxel-thin walls,
+* connectivity -- a single connected solid component, evaluated under
+  **periodic (wrap-around) boundaries** because a unit cell is tessellated:
+  solid leaving one face re-enters the opposite one. Checking the unwrapped box
+  would count one continuous network as several islands (it scored the real
+  gyroid cells at 9%), so the wrap is part of the check,
+* minimum wall thickness -- morphological opening (also periodic) rejects
+  1-voxel-thin walls, without penalising members merely clipped by a face,
 * overhang angle estimate -- approximate fraction of voxels lacking downward
   support (full support-structure analysis is out of baseline scope).
+
+Define ``filter_generated`` in ``src.validation`` to substitute a custom filter.
 
 ``--no-filter`` reports on every sample regardless of validity (the report is
 labelled accordingly).
@@ -29,81 +35,21 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy import ndimage
 
 from src.config import CONDITIONING_ORDER, REPO_ROOT, load_yaml
 from src.fea.property_extraction import effective_properties
+from src.validation import evaluate_validity, safe_sample_name
 
 LOG = logging.getLogger(__name__)
 
 COND_NAMES = list(CONDITIONING_ORDER)
 
 
-def _safe_sample_name(name: str, source: str) -> str:
-    """Reject manifest entries that escape ``samples_dir`` (path traversal)."""
-    p = Path(name)
-    if p.is_absolute() or len(p.parts) != 1 or p.name in ("", ".", ".."):
-        raise ValueError(
-            f"{source} entry {name!r} must be a bare filename inside the samples directory"
-        )
-    return str(p)
-
-
 # --------------------------------------------------------------------------- #
 # Synthesizability filter (ROADMAP 4.6, step 4)
 # --------------------------------------------------------------------------- #
-
-def compute_components(vol: np.ndarray) -> int:
-    """Number of 26-connected solid components (0 for an empty grid).
-
-    The 3x3x3 structuring element matches the adjacency convention used by the
-    Option-B physics proxy (``src/losses/physics_loss.py``), so the soft
-    connectivity signal and the hard validity filter agree on corner-touching
-    structures.
-    """
-    solid = np.asarray(vol, dtype=bool)
-    if not solid.any():
-        return 0
-    _, n = ndimage.label(solid, structure=np.ones((3, 3, 3), dtype=bool))
-    return int(n)
-
-
-def filter_connectivity(vol: np.ndarray) -> bool:
-    """True iff the solid phase is a single connected component."""
-    return compute_components(vol) == 1
-
-
-def thin_solid_voxels(vol: np.ndarray, min_wall: int = 2) -> float:
-    """Fraction of solid voxels removed by an opening with a ``min_wall`` cube.
-
-    A single opening strips features thinner than ``min_wall`` voxels, so a
-    nonzero fraction flags 1-voxel-thin walls.
-    """
-    solid = np.asarray(vol, dtype=bool)
-    if not solid.any():
-        return 0.0
-    structure = np.ones((min_wall,) * 3, dtype=bool)
-    opened = ndimage.binary_opening(solid, structure=structure)
-    return float(solid.sum() - opened.sum()) / float(solid.sum())
-
-
-def overhang_fraction(vol: np.ndarray) -> float:
-    """Approximate fraction of solid voxels lacking downward support.
-
-    A voxel at z>0 is "supported" if the 3x3 block directly beneath it
-    contains any solid.  The estimate ignores the build platform and is meant
-    as a coarse manufacturability heuristic only.
-    """
-    solid = np.asarray(vol, dtype=bool)
-    if not solid.any():
-        return 0.0
-    above = solid[:, :, 1:]
-    lower = solid[:, :, :-1]
-    support = ndimage.binary_dilation(
-        lower, structure=np.ones((3, 3, 1), dtype=bool))
-    unsupported = above & (~support)
-    return float(unsupported.sum()) / float((above | lower).sum())
-
+# The connectivity / wall-thickness / overhang checks live in ``src.validation``
+# (imported above).
 
 def _plugged_filter() -> object | None:
     """Optional external filter; returns ``None`` when absent."""
@@ -112,20 +58,6 @@ def _plugged_filter() -> object | None:
     except ImportError:
         return None
     return filter_generated
-
-
-def evaluate_validity(vol: np.ndarray, cfg: dict) -> tuple[bool, str]:
-    """Full synthesizability check; returns (valid, reason)."""
-    if compute_components(vol) != 1:
-        return False, "connectivity"
-    min_wall = int(cfg.get("min_wall_voxels", 2))
-    max_thin = float(cfg.get("max_thin_fraction", 0.05))
-    if thin_solid_voxels(vol, min_wall) > max_thin:
-        return False, "min_wall_thickness"
-    max_overhang = float(cfg.get("max_overhang_fraction", 1.0))
-    if overhang_fraction(vol) > max_overhang:
-        return False, "overhang"
-    return True, "ok"
 
 
 # --------------------------------------------------------------------------- #
@@ -174,6 +106,10 @@ def _init_fea_worker(opts: dict) -> None:
     Caps BLAS/PETSc threads so N workers never multiply the core count.
     """
     threads = max(1, int(opts.get("omp_threads", 1)))
+    # NOTE: spawned children import this module (and numpy) before the
+    # initializer runs, so these vars only bind to libraries loaded *after*
+    # this point -- dolfinx/PETSc/scipy, imported just below (the heavy
+    # consumers); already-loaded OpenBLAS in the child is unaffected.
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ[var] = str(threads)
     from src.fea import set_base_material, set_void_scale
@@ -221,16 +157,18 @@ def run_evaluate(cfg: dict, samples_dir: Path, out_dir: Path,
     # locked config are excluded with a distinct reason (not an FEA failure).
     jobs: list[tuple[int, object, np.ndarray, bool]] = []
     for idx, (_, row) in enumerate(manifest.iterrows()):
-        fname = _safe_sample_name(str(row["file"]), "--samples-dir manifest")
+        fname = safe_sample_name(str(row["file"]), "--samples-dir manifest")
         fpath = samples_dir / fname
         if not fpath.exists():
             LOG.warning("missing sample %s", fpath)
             continue
         voxels = np.load(fpath)
-        res_ok = voxels.shape[0] == res_expected
+        # Check every axis, not just the first: a non-cubic (32, 16, 16) grid
+        # would otherwise pass and only fail downstream inside FEA.
+        res_ok = voxels.shape == (res_expected, res_expected, res_expected)
         if not res_ok:
-            LOG.error("sample %s has resolution %d != config %d; excluded",
-                      fname, voxels.shape[0], res_expected)
+            LOG.error("sample %s has shape %s != config %dx%dx%d; excluded",
+                      fname, voxels.shape, res_expected, res_expected, res_expected)
         jobs.append((idx, row, voxels, res_ok))
 
     c6s: dict[int, np.ndarray] = {}
@@ -276,7 +214,7 @@ def run_evaluate(cfg: dict, samples_dir: Path, out_dir: Path,
                 ep = effective_properties(c6s[idx])
                 E_eff, nu_eff = float(ep.E), float(ep.nu)
                 reason = "ok"
-            except Exception:  # noqa: BLE001
+            except Exception:  # any FEA/property-extraction error counts as a failure
                 fea_fail += 1
                 E_eff = nu_eff = float("nan")
                 reason = "fea_failed"
@@ -333,7 +271,7 @@ def run_evaluate(cfg: dict, samples_dir: Path, out_dir: Path,
     else:
         report["reconstruction"] = {}
 
-    with open(out_dir / "report.json", "w", encoding="utf-8") as fh:
+    with (out_dir / "report.json").open("w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, default=float)
 
     if len(valid_df):
@@ -354,7 +292,7 @@ def _write_plots(df: pd.DataFrame, out_dir: Path) -> None:
     tgt_col = {"E": "target_E", "relative_density": "target_rho", "nu": "target_nu"}
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 3.5))
-    for ax, name in zip(axes, COND_NAMES):
+    for ax, name in zip(axes, COND_NAMES, strict=True):
         pc, tc = pred_col[name], tgt_col[name]
         ax.scatter(df[tc], df[pc], s=6, alpha=0.5)
         lo = min(df[tc].min(), df[pc].min())
@@ -368,7 +306,7 @@ def _write_plots(df: pd.DataFrame, out_dir: Path) -> None:
     plt.close(fig)
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 3.5))
-    for ax, name in zip(axes, COND_NAMES):
+    for ax, name in zip(axes, COND_NAMES, strict=True):
         pc, tc = pred_col[name], tgt_col[name]
         rel = np.abs(df[pc] - df[tc]) / np.maximum(1e-9, np.abs(df[tc]))
         ax.hist(rel.clip(upper=1.0), bins=40)

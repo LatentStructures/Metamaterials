@@ -66,10 +66,10 @@ def test_p_losses_returns_scalar_and_decreases():
     first = loss.item()
     for _ in range(60):
         opt.zero_grad()
-        l = d.p_losses(model, x, c)
-        l.backward()
+        step_loss = d.p_losses(model, x, c)
+        step_loss.backward()
         opt.step()
-    assert l.item() < first, "training did not reduce eps-MSE"
+    assert step_loss.item() < first, "training did not reduce eps-MSE"
 
 
 def test_ddim_rejects_invalid_steps():
@@ -96,3 +96,27 @@ def test_ddim_samples_shape_and_reproducible():
     # noise-conditioned sampling is non-deterministic without a seed
     c_rnd = d.sample_ddim(model, c, shape, steps=2)
     assert c_rnd.shape == shape
+
+
+def test_ddim_performs_terminal_denoise_to_x0():
+    class ZeroEpsilon(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+            self.seen = []
+
+        def forward(self, x, t, cond):
+            self.seen.extend(t.tolist())
+            return torch.zeros_like(x)
+
+    diffusion = GaussianDiffusion(T=8)
+    model = ZeroEpsilon()
+    cond = torch.zeros(1, 3)
+    seed = 13
+    gen = torch.Generator().manual_seed(seed)
+    initial_noise = torch.randn((1, 1, 2, 2, 2), generator=gen)
+    expected = initial_noise / diffusion.schedule.alpha_bar[-1].sqrt()
+    result = diffusion.sample_ddim(model, cond, tuple(initial_noise.shape),
+                                   steps=1, clamp=False, seed=seed)
+    assert model.seen == [7]
+    assert torch.allclose(result, expected)

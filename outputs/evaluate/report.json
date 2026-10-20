@@ -1,0 +1,8 @@
+{
+  "no_filter": false,
+  "total_samples": 50,
+  "fea_failures": 0,
+  "validity_rate": 0.0,
+  "filter_used": "own_core",
+  "reconstruction": {}
+}

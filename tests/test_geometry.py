@@ -30,6 +30,23 @@ def test_all_families_have_bounds():
         assert lo < hi and lo >= 0.0
 
 
+@pytest.mark.parametrize("family, shape_values", [
+    ("cubic_strut", (1.0, 2.0)),
+    ("octet_truss", (1.0, 2.0)),
+    ("gyroid", (0.0, 0.08)),
+])
+def test_second_shape_parameter_changes_geometry_at_fixed_density(family, shape_values):
+    first, second = [sample_for_density(family, 0.3, 32,
+                                        shape_parameter=value)[0]
+                     for value in shape_values]
+    assert first.shape == second.shape == (32, 32, 32)
+    assert first.dtype == second.dtype == np.uint8
+    assert not np.array_equal(first, second)
+    # The primary knob is still solved to the requested material fraction.
+    assert abs(float(first.mean()) - 0.3) <= 0.015
+    assert abs(float(second.mean()) - 0.3) <= 0.015
+
+
 @pytest.mark.parametrize("family", FAMILIES)
 @pytest.mark.parametrize("res", [16, 32])
 def test_struct_tetra_mesh_positive_and_flagged(family, res):

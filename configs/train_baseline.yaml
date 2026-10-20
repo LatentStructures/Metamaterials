@@ -3,15 +3,32 @@
 seed: 0
 data:
   hdf5: data/dataset_train.h5
+  min_samples: 1600                              # at least the 80% train share of 2,000 valid cells
   conditioning_order: [E, relative_density, nu]   # must match manifest + HDF5 /conditioning_vector (Phase 1, Section 3.4)
   augmentation: true                              # random proper rotation per sample (the 24 cube rotations; no mirrors, Section 3.4)
 optimizer:
-  lr: 1e-4
+  lr: 0.0001
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
   lr_schedule: cosine                            # cosine decay (Phase 2, Section 4.5)
+  grad_clip: 1.0                                 # global-norm clip; bounds the Option-B physics-gradient
+                                                 # spikes (pre-clip norms ~1,577 early, up to 4,229 over
+                                                 # iters 20k-30k) that otherwise
+                                                 # destabilize training post-warmup -- validated by the
+                                                 # 5k-step overfit A/B/C ladder (lambda=0.05+clip matches
+                                                 # lambda=0 convergence and generation; lambda reduction
+                                                 # alone does not)
 ema:
   enabled: true
-  decay: 0.9999
-batch_size: 32                                   # 32³ fits on 24 GB; reduce on smaller GPUs
+  decay: 0.9999                                  # NOTE: mis-scaled to this schedule. The EMA shadow
+                                                 # spans 1/(1-decay) = 10k steps centred ~step 25k of
+                                                 # 30k, before the cosine LR anneals to 0, so it is a
+                                                 # less-converged model: 14% valid grids vs 92% for live
+                                                 # (mean 11.5 vs 1.6 connected components). Sample with
+                                                 # --weights live (the default). See PROJECT.md §8.
+batch_size: 32                                   # 32³ at batch 32 fits the 8 GB training GPU (RTX 4060,
+                                                  # validated by the 30k run); reduce on smaller cards
 mixed_precision: bf16                            # bf16 preferred where supported
 epochs: 500                                     # tuned budget to hit deadline; overridden by --overfit
 checkpoint_every: 500
@@ -25,11 +42,11 @@ perf:                                             # GPU throughput knobs (src/tr
   pin_memory: true
 physics_loss:                                    # Option B only (Phase 2, Section 4.4); Option A is a contingency
   option: B
-  lambda_1: 0.0
+  lambda_1: 0.05                               # physics-on baseline run; initial value for ablation (Phase 2, Section 4.4)
   iterations: 60                                 # power-iteration budget inside the autograd graph (perf/VRAM trade-off)
   warmup_fraction: 0.2                           # λ₁ warmed from 0 over first 20% of training
-  ablation: {lambda_1: 0.05, tag: abl_physics}   # run the ablation pair (Phase 2, Section 4.4)
+  ablation: {lambda_1: 0.0, tag: abl_physics}    # invoke with --physics-ablation (Phase 2, Section 4.4)
 logging:
-  backend: wandb                                 # or tensorboard
+  backend: tensorboard                            # view via: python -m tensorboard --logdir runs
   project: metamaterials-baseline
   sample_interval: 5000
