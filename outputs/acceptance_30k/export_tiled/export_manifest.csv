@@ -1,0 +1,6 @@
+file,name,exported,stl,reason,vertices,faces,is_watertight,euler_characteristic
+sample_t16_s00.npy,sample_t16_s00,True,outputs/acceptance_30k/export_tiled/sample_t16_s00.stl,ok,33128,66364,True,-54
+sample_t25_s00.npy,sample_t25_s00,True,outputs/acceptance_30k/export_tiled/sample_t25_s00.stl,ok,49352,98812,True,-54
+sample_t42_s00.npy,sample_t42_s00,True,outputs/acceptance_30k/export_tiled/sample_t42_s00.stl,ok,79944,160092,True,-102
+sample_t20_s00.npy,sample_t20_s00,True,outputs/acceptance_30k/export_tiled/sample_t20_s00.stl,ok,55104,110316,True,-54
+sample_t27_s00.npy,sample_t27_s00,True,outputs/acceptance_30k/export_tiled/sample_t27_s00.stl,ok,48544,97196,True,-54

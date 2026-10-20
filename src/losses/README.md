@@ -18,7 +18,9 @@ L_total = L_diffusion + lambda_1(t) * L_physics_proxy
 - `L_physics_proxy` is evaluated on the **soft, pre-threshold denoised occupancy**
   `p = clamp(x0_pred, 0, 1)`, shape `(B, 1, 32, 32, 32)`.
 - `lambda_1(t)` is warmed up linearly from `0` to the configured value over the
-  first `warmup_fraction` (default `0.2`) of total training steps, so the model
+  first `warmup_fraction` of total training steps (set to `0.2` in
+  `configs/train_baseline.yaml`; the code falls back to `0.0` — no warmup — if
+  the key is absent), so the model
   learns basic geometry before physics constraints act. Grid resolution and all
   weights come from config only (`configs/train_baseline.yaml`,
   `physics_loss.*`); nothing is hardcoded.
@@ -75,9 +77,22 @@ shallow), configurable under `physics_loss.iterations` in the train config.
 For a fully empty grid take `L_conn = 1` (maximally disconnected); a
 connected-but-floating single component also scores near 0 (it passes the
 binary validity filter).
-This term protects the validity rate; it does not steer properties toward the
-conditioning targets — that weakness is exactly what Option A (a frozen
-surrogate critic, contingency only) fixes.
+This term was designed on the hypothesis that it protects the validity rate; it
+does not steer properties toward the conditioning targets — that weakness is
+exactly what Option A (a frozen surrogate critic, contingency only) fixes.
+
+**Measured outcome (λ₁ = 0 ablation, 30k iters, 50 held-out targets, same seed):
+the term did not protect validity.** The control matched or beat the physics-on
+run on every metric — validity 94.0% vs 92.0%, E error 2.44% vs 3.63%, ρ 1.30% vs
+1.51%, ν 0.56% vs 0.99%, final loss 0.0033 vs 0.0118 — and the physics-on arm
+showed the gradient bursts that made `optimizer.grad_clip` necessary (pre-clip
+norms up to 4,229 post-warmup, vs 1.31 without the term). The likely mechanism is
+that the connectivity proxy rewards connectedness, and thin struts are the
+cheapest way to stay connected at low density: paired across the same targets,
+37/50 are thinner under physics-on than physics-off (Wilcoxon p = 0.0015). So the
+term trades wall thickness for connectivity, which the existing `min_wall_voxels`
+filter then rejects. Treat the claim above as the design intent, not a result;
+see `PROJECT.md` §8 for the full comparison.
 
 Reference implementation already exists for the *hard* version in
 `src/validation.compute_components` (binary 26-connected labeling); the two share

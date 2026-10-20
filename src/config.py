@@ -23,7 +23,7 @@ of the conditioning vector.
 
 
 def load_yaml(path: str | Path) -> dict:
-    with open(path, "r", encoding="utf-8") as fh:
+    with Path(path).open(encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
 

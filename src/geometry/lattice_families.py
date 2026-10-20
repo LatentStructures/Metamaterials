@@ -201,9 +201,6 @@ def sample_for_density(
         else:
             hi, d_hi = mid, d_mid
     # Pick the bracketing parameter with the achieved density closest to target.
-    if abs(d_hi - target_density) < abs(d_lo - target_density):
-        final_p = hi
-    else:
-        final_p = lo
+    final_p = hi if abs(d_hi - target_density) < abs(d_lo - target_density) else lo
     grid = generate_voxels(family, final_p, resolution, shape_parameter)
     return grid, float(relative_density(grid))

@@ -1,0 +1,21 @@
+# Lint rule set for the repo-wide gate: `ruff check src tests`
+# (AGENTS.md). Pinned explicitly so the gate does not drift with ruff's
+# default set across versions.
+target-version = "py311"
+line-length = 88
+
+[lint]
+select = [
+    "E4",   # pycodestyle errors: imports, indentation
+    "E7",   # pycodestyle errors: statement issues
+    "E9",   # pycodestyle errors: runtime
+    "F",    # pyflakes: unused names, undefined names
+    "W",    # pycodestyle warnings
+    "B",    # flake8-bugbear: common footguns (zip strict, raise-from, ...)
+    "UP",   # pyupgrade: modern-syntax cleanups
+    "I",    # isort: import sorting
+    "RUF",  # ruff-specific rules (incl. RUF100 unused-noqa)
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "PTH",  # flake8-use-pathlib: Path over open()/os.path
+]

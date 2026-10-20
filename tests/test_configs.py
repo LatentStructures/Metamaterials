@@ -1,7 +1,12 @@
 """Regression checks for baseline config values and cross-config consistency."""
 import pytest
 
-from src.config import CONDITIONING_ORDER, REPO_ROOT, load_yaml
+from src.config import (
+    CONDITIONING_ORDER,
+    REPO_ROOT,
+    check_conditioning_order,
+    load_yaml,
+)
 
 
 def _cfg(name: str) -> dict:
@@ -39,7 +44,7 @@ def test_model_config_has_locked_diffusion_and_sampling_values():
 
 
 @pytest.mark.parametrize("name", [
-    "train_baseline.yaml", "train_4060.yaml",
+    "train_baseline.yaml",
 ])
 def test_training_profiles_use_option_b_and_production_data(name):
     cfg = _cfg(name)
@@ -50,8 +55,8 @@ def test_training_profiles_use_option_b_and_production_data(name):
     assert cfg["physics_loss"]["ablation"]["lambda_1"] == 0.0
     assert cfg["optimizer"]["lr"] == 1e-4
     assert cfg["optimizer"]["weight_decay"] == 0.01
-    # Validated fix for the unbounded Option-B gradient bursts: both train
-    # profiles must keep it, or a config can launch the diverging setup (AGENTS.md).
+    # Validated fix for the unbounded Option-B gradient bursts: the train
+    # profile must keep it, or a config can launch the diverging setup (AGENTS.md).
     assert cfg["optimizer"]["grad_clip"] == 1.0
     assert cfg["optimizer"]["betas"] == [0.9, 0.999]
     assert cfg["ema"]["decay"] == 0.9999
@@ -63,3 +68,28 @@ def test_evaluation_material_and_resolution_match_dataset():
     assert evaluation["resolution"] == dataset["resolution"]
     assert evaluation["base_material"] == dataset["base_material"]
     assert evaluation["void_scale"] == dataset["homogenization"]["void_scale"]
+
+
+def test_check_conditioning_order_accepts_locked_order():
+    # top level (dataset.yaml) and nested under data (training configs)
+    check_conditioning_order({"conditioning_order": CONDITIONING_ORDER})
+    check_conditioning_order({"data": {"conditioning_order": CONDITIONING_ORDER}})
+
+
+def test_check_conditioning_order_rejects_swaps_and_extensions():
+    wrong_configs = [
+        {"conditioning_order": ["E", "nu", "relative_density"]},
+        {"data": {"conditioning_order": ["relative_density", "E", "nu"]}},
+        # G is never a conditioning target, and the width is locked at 3
+        {"data": {"conditioning_order": ["E", "relative_density", "nu", "G"]}},
+    ]
+    for cfg in wrong_configs:
+        with pytest.raises(ValueError, match="locked invariant"):
+            check_conditioning_order(cfg)
+
+
+def test_check_conditioning_order_absent_key_is_tolerated():
+    # The YAML key documents the lock; configs predating the check omit it,
+    # and absence must not fail (only a contradicting declaration does).
+    check_conditioning_order({})
+    check_conditioning_order({"data": {}})

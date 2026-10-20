@@ -55,7 +55,7 @@ def _write_tiny_config(tmp_path: pytest.TempPathFactory) -> str:
         "fea_retries": 1,
     }
     path = tmp_path / "tiny.yaml"
-    with open(path, "w", encoding="utf-8") as fh:
+    with path.open("w", encoding="utf-8") as fh:
         yaml.safe_dump(cfg, fh)
     return str(path)
 

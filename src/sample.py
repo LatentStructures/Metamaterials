@@ -79,6 +79,13 @@ def _parse():
     ap.add_argument("--steps", type=int, default=None,
                     help="DDIM steps (locked 50-100); default from model config sampling.steps")
     ap.add_argument("--n-per-target", type=int, default=1)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="override the sampling seed (default: model config sampling.seed)")
+    ap.add_argument("--weights", choices=("ema", "live"), default="live",
+                    help="checkpoint weights to sample with. Default 'live': at the "
+                         "baseline's decay=0.9999 over a 30k cosine-annealed run the "
+                         "EMA shadow lags into a less-converged region and generates "
+                         "fragmented grids (14%% valid vs 92%% live); see PROJECT.md §8")
     ap.add_argument("--export-stl", action="store_true")
     return ap.parse_args()
 
@@ -100,8 +107,18 @@ def main() -> None:
 
     model = UNet3D.from_config(mcfg["unet3d"]).to(device)
     ck = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    # Prefer EMA weights for inference when the checkpoint contains them.
-    model.load_state_dict(ck.get("ema") or ck["model"])
+    # Default is 'live' (see --weights): with decay=0.9999 the EMA shadow spans
+    # ~10k steps centred ~step 25k, i.e. before the cosine LR reaches 0, so it
+    # samples a less-converged model and returns fragmented (invalid) grids.
+    # 'ema' stays available for the documented A/B.
+    if args.weights == "ema":
+        if not ck.get("ema"):
+            raise SystemExit(f"--weights ema requested but {args.checkpoint} has no 'ema' entry")
+        state = ck["ema"]
+    else:
+        state = ck["model"]
+    model.load_state_dict(state)
+    LOG.info("sampling with %s weights", args.weights)
     diffusion = build_diffusion(mcfg["diffusion"], device)
     LOG.info("loaded checkpoint iter=%s device=%s", ck.get("iter", "?"), device)
 
@@ -117,15 +134,21 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    base_seed = int(args.seed) if args.seed is not None else int(sampling_cfg.get("seed", tcfg["seed"]))
+    LOG.info("sampling %d target(s) x %d draw(s), base seed %d", len(conds), args.n_per_target, base_seed)
     grid_rows = []
     model.eval()
     with torch.no_grad():
         for ti, c in enumerate(conds):
             c_b = torch.as_tensor(c[None], dtype=torch.float32, device=device).repeat(args.n_per_target, 1)
+            # One seed per target (base_seed + ti * n); the N draws differ
+            # because sample_ddim draws N independent noise rows for that seed,
+            # so --n-per-target N returns distinct samples with real spread for
+            # the validity rate, and no two targets ever share a noise batch.
             gen = diffusion.sample_ddim(model, c_b, (args.n_per_target, 1, 32, 32, 32),
                                         steps=steps,
                                         eta=float(sampling_cfg.get("eta", 0.0)),
-                                        seed=int(sampling_cfg.get("seed", tcfg["seed"])) + ti)
+                                        seed=base_seed + ti * args.n_per_target)
             for si in range(args.n_per_target):
                 v = (gen[si, 0].cpu().numpy() > 0.5).astype(np.uint8)
                 name = f"sample_t{ti:02d}_s{si:02d}"

@@ -36,3 +36,12 @@
 | solid_cube | 4.61073e-12 | yes |
 | laminate_x | 1.25371e-07 | yes |
 | aligned_rods_x | 6.23112e-07 | yes |
+
+## Periodic validity (synthesizability filter)
+- overall: 87.7% (2104/2400)
+- connectivity is counted **periodically** (components merged across
+  wrapped faces); the unwrapped count is far lower and is wrong for
+  unit cells.
+- cubic_strut: 86.9% (695/800)
+- gyroid: 86.8% (694/800)
+- octet_truss: 89.4% (715/800)

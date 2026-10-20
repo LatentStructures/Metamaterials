@@ -14,6 +14,6 @@ n_workers: 8                        # parallel FEA re-homogenizer worker process
 
 # Synthesizability filter: the built-in checks live in `src.validation`
 # (a `filter_generated` defined there overrides them).
-min_wall_voxels: 2                  # opening size for the 1-voxel-thin-wall check
+min_wall_voxels: 2                  # opening size for the 1-voxel-thin-wall check (periodic)
 max_thin_fraction: 0.05             # reject if opening removes more solid than this
 max_overhang_fraction: 1.0          # approximate AM overhang heuristic (baseline: off)

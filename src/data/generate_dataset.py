@@ -83,7 +83,7 @@ def _load_homogenizer(mock_fea: bool, validation_tolerance: float, res: int,
             raise SystemExit(
                 "src/fea/homogenization.py is not available.  "
                 "Run inside the conda env where dolfinx is installed."
-            )
+            ) from None
         LOG.warning(
             "Using --mock-fea: stiffness is UNPHYSICAL. "
             "Do NOT commit mock data to production."
@@ -133,7 +133,7 @@ def _sample_all(config: dict, rng: np.random.Generator) -> list[dict]:
 
     samples = []
     shape_ranges = config.get("shape_parameter_ranges", {})
-    for family, n in zip(families, cells_per_family):
+    for family, n in zip(families, cells_per_family, strict=True):
         for _ in range(n):
             target_rho = rng.uniform(density_lo, density_hi)
             sample = {
@@ -184,7 +184,7 @@ def _stratify_splits(samples: list[dict], frac: dict[str, float],
             continue
         row_total = sum(len(groups[key]) for key in group_keys)
         targets = {split: row_total * weight for split, weight in frac.items()}
-        assigned = {split: 0 for split in frac}
+        assigned = dict.fromkeys(frac, 0)
         # Place large duplicate groups first, balancing by number of records
         # while keeping each exact geometry wholly within one split.
         ordered = sorted(group_keys, key=lambda key: len(groups[key]), reverse=True)
@@ -260,6 +260,10 @@ def _init_worker(opts: dict) -> None:
     with unlimited OpenBLAS threads thrash instead of scale).
     """
     threads = max(1, int(opts.get("omp_threads", 1)))
+    # NOTE: spawned children re-import this module (and numpy/torch) before the
+    # initializer runs, so these vars only bind to libraries loaded *after* this
+    # point -- dolfinx/PETSc/scipy, imported just below, which are the heavy
+    # consumers anyway. OpenBLAS/torch already loaded in the child are unaffected.
     for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ[var] = str(threads)
     from src.fea import set_base_material, set_void_scale
@@ -386,6 +390,8 @@ def _load_checkpoint(path: Path) -> list[dict]:
         C6 = np.zeros((6, 6), dtype=np.float32)
         if c6_cols:
             C6.flat[:] = row[c6_cols].to_numpy(dtype=np.float32)
+        # None for legacy checkpoints (which predate the column); the resume
+        # path in main() backfills it from the voxel file name before saving.
         sample_index = int(row["sample_index"]) if "sample_index" in df.columns else None
         out.append({
             "family": row["family"],
@@ -533,6 +539,9 @@ def generate(config_path: str | Path, mock_fea: bool = False,
         idx = s.get("sample_index")
         if idx is None:  # legacy checkpoint: recover the sample index from the file name
             idx = int(Path(s["voxel_path"]).stem.rsplit("_", 1)[1])
+            # Backfill: without this the key stays None and _save_checkpoint
+            # (int(None)) / the records.sort below both raise TypeError.
+            s["sample_index"] = idx
         done.add(idx)
 
     max_attempts = int(config.get("fea_retries", 3))
@@ -687,13 +696,59 @@ def generate(config_path: str | Path, mock_fea: bool = False,
         LOG.info("wrote %d distinct held-out target vectors to %s",
                  target_count, target_path)
 
+    validity_report = _validity_summary(manifest, records, config)
     _write_data_card(manifest, config, records, failed,
-                     void_scale, float(time.time() - t0), validation)
+                     void_scale, float(time.time() - t0), validation,
+                     validity_report)
+
+
+def _validity_summary(manifest: pd.DataFrame, records: list[dict],
+                      config: dict) -> dict | None:
+    """Periodic synthesizability rate over the dataset, for the data card.
+
+    Uses the same filter thresholds as the evaluation pipeline
+    (``configs/evaluate.yaml``) so the card cannot drift from the real filter.
+    Returns ``None`` if the voxels are unavailable (e.g. a resumed run whose
+    arrays are no longer in memory), in which case the card just omits the
+    section.
+    """
+    if not records or "voxels" not in records[0]:
+        return None
+    try:
+        from src.config import load_yaml
+        from src.validation import evaluate_validity
+
+        eval_cfg_path = REPO_ROOT / "configs" / "evaluate.yaml"
+        filter_cfg = load_yaml(eval_cfg_path) if eval_cfg_path.exists() else {}
+        rates: dict[str, dict] = {}
+        valid = 0
+        for r in records:
+            ok, _ = evaluate_validity(np.asarray(r["voxels"], dtype=bool), filter_cfg)
+            valid += int(ok)
+            fam = r["family"]
+            rates.setdefault(fam, {"valid": 0, "total": 0})
+            rates[fam]["valid"] += int(ok)
+            rates[fam]["total"] += 1
+        total = len(records)
+        return {
+            "rate": valid / total if total else 0.0,
+            "valid": valid,
+            "total": total,
+            "by_family": {
+                fam: {"rate": v["valid"] / v["total"] if v["total"] else 0.0,
+                      "valid": v["valid"], "total": v["total"]}
+                for fam, v in rates.items()
+            },
+        }
+    except Exception:  # card generation must never sink a completed dataset
+        LOG.warning("periodic validity summary unavailable", exc_info=True)
+        return None
 
 
 def _write_data_card(manifest: pd.DataFrame, config: dict, records: list[dict],
                      failed: int, void_scale: float, wall_s: float,
-                     validation: dict | None = None) -> None:
+                     validation: dict | None = None,
+                     validity_report: dict | None = None) -> None:
     """Write ``data/data_card.md`` summarising the generated dataset (ROADMAP 3.4)."""
     res = config["resolution"]
     e_eff = manifest["E_eff"].to_numpy()
@@ -754,6 +809,27 @@ def _write_data_card(manifest: pd.DataFrame, config: dict, records: list[dict],
             lines.append(
                 f"| {name} | {_f(info['max_rel_err'])} | "
                 f"{'yes' if info['ok'] else 'no'} |"
+            )
+
+    # Periodic validity is a property of the *data*, not of one downstream run,
+    # so record it here. It is the fraction of cells that pass the
+    # synthesizability filter, and it must be computed with periodic
+    # connectivity: counting components in the unwrapped box undercounts badly
+    # (it read 50.8% on this dataset vs 87.7% correctly measured).
+    if validity_report is not None:
+        lines += [
+            "",
+            "## Periodic validity (synthesizability filter)",
+            (f"- overall: {validity_report['rate'] * 100:.1f}%"
+             f" ({validity_report['valid']}/{validity_report['total']})"),
+            "- connectivity is counted **periodically** (components merged across",
+            "  wrapped faces); the unwrapped count is far lower and is wrong for",
+            "  unit cells.",
+        ]
+        for family, info in sorted(validity_report["by_family"].items()):
+            lines.append(
+                f"- {family}: {info['rate'] * 100:.1f}%"
+                f" ({info['valid']}/{info['total']})"
             )
 
     path = REPO_ROOT / "data" / "data_card.md"

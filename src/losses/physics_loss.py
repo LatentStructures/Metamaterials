@@ -122,7 +122,9 @@ def connectivity_proxy_loss(
 
     ``cond`` and ``t`` are accepted for compatibility with the training-loop
     call signature but do not influence Option B (the baseline proxy is
-    unconditional -- it only protects the validity rate).
+    unconditional -- it sees neither the conditioning targets nor the timestep).
+    It was designed to protect the validity rate; the lambda_1 = 0 ablation
+    measured no benefit on any metric (see ``README.md``).
 
     ``iterations`` bounds the power iteration that runs inside the autograd
     graph. The default of 60 is the train-config value

@@ -69,7 +69,6 @@ class MetamaterialDataset(Dataset):
             self.has_stiffness = "/stiffness_tensor" in h5
             self.stiffness = (h5["/stiffness_tensor"][...].astype(np.float32)
                               if self.has_stiffness else None)
-            self.has_metadata = "/metadata" in h5
             stats_group = h5["/conditioning_vector"].attrs
             if "mean" in stats_group and "std" in stats_group:
                 self.stats = ConditioningStats(

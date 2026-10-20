@@ -13,15 +13,22 @@ optimizer:
   eps: 1.0e-8
   lr_schedule: cosine                            # cosine decay (Phase 2, Section 4.5)
   grad_clip: 1.0                                 # global-norm clip; bounds the Option-B physics-gradient
-                                                 # spikes (pre-clip norms up to ~18 measured) that otherwise
+                                                 # spikes (pre-clip norms ~1,577 early, up to 4,229 over
+                                                 # iters 20k-30k) that otherwise
                                                  # destabilize training post-warmup -- validated by the
                                                  # 5k-step overfit A/B/C ladder (lambda=0.05+clip matches
                                                  # lambda=0 convergence and generation; lambda reduction
                                                  # alone does not)
 ema:
   enabled: true
-  decay: 0.9999
-batch_size: 32                                   # 32³ fits on 24 GB; reduce on smaller GPUs
+  decay: 0.9999                                  # NOTE: mis-scaled to this schedule. The EMA shadow
+                                                 # spans 1/(1-decay) = 10k steps centred ~step 25k of
+                                                 # 30k, before the cosine LR anneals to 0, so it is a
+                                                 # less-converged model: 14% valid grids vs 92% for live
+                                                 # (mean 11.5 vs 1.6 connected components). Sample with
+                                                 # --weights live (the default). See PROJECT.md §8.
+batch_size: 32                                   # 32³ at batch 32 fits the 8 GB training GPU (RTX 4060,
+                                                  # validated by the 30k run); reduce on smaller cards
 mixed_precision: bf16                            # bf16 preferred where supported
 epochs: 500                                     # tuned budget to hit deadline; overridden by --overfit
 checkpoint_every: 500

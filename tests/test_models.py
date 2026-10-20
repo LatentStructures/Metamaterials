@@ -66,10 +66,10 @@ def test_p_losses_returns_scalar_and_decreases():
     first = loss.item()
     for _ in range(60):
         opt.zero_grad()
-        l = d.p_losses(model, x, c)
-        l.backward()
+        step_loss = d.p_losses(model, x, c)
+        step_loss.backward()
         opt.step()
-    assert l.item() < first, "training did not reduce eps-MSE"
+    assert step_loss.item() < first, "training did not reduce eps-MSE"
 
 
 def test_ddim_rejects_invalid_steps():

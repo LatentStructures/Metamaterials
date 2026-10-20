@@ -36,7 +36,7 @@ import ufl
 from dolfinx import fem
 from dolfinx import mesh as dmesh
 from mpi4py import MPI
-from scipy.sparse.linalg import cg, splu
+from scipy.sparse.linalg import cg
 
 from src.voigt import VOIGT_PAIRS
 
@@ -57,7 +57,6 @@ _VOID_SCALE = 1e-6
 # per cell).  Voxel-homogenization practice (Dong et al. 2018; ParFE, bone
 # micro-FE, FANS) solves with preconditioned CG: with a Jacobi diagonal the
 # res-32 solve drops to ~1-2 s/cell (measured ~1.5 s vs >10 min for splu).
-_LINEAR_SOLVER = "cg"
 _CG_RTOL = 1e-6
 _CG_MAXITER = 5000
 
@@ -77,10 +76,6 @@ def set_void_scale(scale: float) -> None:
 
 def base_material() -> tuple[float, float]:
     return _BASE_E, _BASE_NU
-
-
-def void_scale() -> float:
-    return _VOID_SCALE
 
 
 # Six unit macroscopic strain load cases as symmetric tensors.  The Voigt
@@ -178,8 +173,8 @@ class _Problem:
                 parent[max(ra, rb)] = min(ra, rb)
 
         for (lo, hi) in pairing.values():
-            for l, h in zip(lo, hi):
-                union(int(l), int(h))
+            for node_lo, node_hi in zip(lo, hi, strict=True):
+                union(int(node_lo), int(node_hi))
 
         self._rep = np.array([find(i) for i in range(self.n**3)])
         slave = np.flatnonzero(self._rep != np.arange(self.n**3))
@@ -260,32 +255,24 @@ class _Problem:
         A_cond = ((self._L @ (A @ self._L.T))[self.kept][:, self.kept]).tocsc()
 
         C6 = np.zeros((6, 6))
-        if _LINEAR_SOLVER == "cg":
-            # Jacobi-preconditioned CG, cold-started per load case.  (Warm
-            # starts from the previous case are NOT used: scipy's cg diverges
-            # for the shear loads otherwise.)
-            diag = A_cond.diagonal()
-            diag = np.where(np.abs(diag) < 1e-14, 1.0, diag)
-            M = sp.diags(1.0 / diag)
-            for k, ebar_t in enumerate(_UNIT_TENSORS):
-                self._ebar.value = ebar_t
-                b = np.asarray(fem.assemble_vector(self._Lf).array, dtype=float)
-                rhs = (self._L @ b)[self.kept]
-                x, info = cg(A_cond, rhs, M=M,
-                             rtol=_CG_RTOL, atol=1e-40, maxiter=_CG_MAXITER)
-                if info != 0:
-                    raise RuntimeError(
-                        f"CG failed to converge on load case {k} (info={info}); "
-                        "the condensed system is (near-)singular")
+        # Jacobi-preconditioned CG, cold-started per load case.  (Warm
+        # starts from the previous case are NOT used: scipy's cg diverges
+        # for the shear loads otherwise.)
+        diag = A_cond.diagonal()
+        diag = np.where(np.abs(diag) < 1e-14, 1.0, diag)
+        M = sp.diags(1.0 / diag)
+        for k, ebar_t in enumerate(_UNIT_TENSORS):
+            self._ebar.value = ebar_t
+            b = np.asarray(fem.assemble_vector(self._Lf).array, dtype=float)
+            rhs = (self._L @ b)[self.kept]
+            x, info = cg(A_cond, rhs, M=M,
+                         rtol=_CG_RTOL, atol=1e-40, maxiter=_CG_MAXITER)
+            if info != 0:
+                raise RuntimeError(
+                    f"CG failed to converge on load case {k} (info={info}); "
+                    "the condensed system is (near-)singular")
 
-                self._expand_solve(x, k, ebar_t, C6)
-        else:
-            lu = splu(A_cond)
-            for k, ebar_t in enumerate(_UNIT_TENSORS):
-                self._ebar.value = ebar_t
-                b = np.asarray(fem.assemble_vector(self._Lf).array, dtype=float)
-                x = lu.solve((self._L @ b)[self.kept])
-                self._expand_solve(x, k, ebar_t, C6)
+            self._expand_solve(x, k, ebar_t, C6)
         return C6, time.time() - t0
 
     def _expand_solve(self, x: np.ndarray, k: int,
@@ -342,10 +329,7 @@ def _max_rel_err(pairs: Iterable[tuple[float, float]],
     the denominator becomes ``max(abs(ref), scale * tolerance)``, so a
     physically zero entry only needs ``|value - ref| < scale * tolerance``.
     """
-    if scale is not None:
-        floor = max(1e-30, scale * tolerance)
-    else:
-        floor = 1e-9
+    floor = max(1e-30, scale * tolerance) if scale is not None else 1e-9
     return max(abs(value - ref) / max(floor, abs(ref))
                for value, ref in pairs)
 

@@ -50,14 +50,14 @@ class FiLMLayer(nn.Module):
     def __init__(self, channels: int, embed_dim: int):
         super().__init__()
         self.norm = nn.GroupNorm(min(32, channels), channels)
-        self.siLU = nn.SiLU()
+        self.silu = nn.SiLU()
         self.in_proj = nn.Conv3d(channels, channels, 3, padding=1, bias=False)
         self.film = nn.Linear(embed_dim, channels * 2)
         self.out_proj = nn.Conv3d(channels, channels, 3, padding=1, bias=False)
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
-        h = self.siLU(h)
+        h = self.silu(h)
         h = self.in_proj(h)
         gamma, beta = self.film(emb).chunk(2, dim=1)
         h = h * (1.0 + gamma[:, :, None, None, None]) + beta[:, :, None, None, None]

@@ -1,0 +1,9 @@
+{
+  "top_n": 5,
+  "tiles": 1,
+  "requested": 5,
+  "exported": 5,
+  "watertight": 5,
+  "failed": 0,
+  "watertightness_expected": "a single periodic cell is open wherever solid crosses a cell face, so non-watertight files are inherent to --tiles 1; use --tiles 2 for a closed, printable block (ROADMAP 4.7)"
+}

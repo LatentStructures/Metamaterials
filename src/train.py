@@ -9,6 +9,7 @@ hardcoded here.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import random
 import time
@@ -29,14 +30,21 @@ from src.models.unet3d import UNet3D
 LOG = logging.getLogger(__name__)
 
 # Default power-iteration budget for the Option-B connectivity proxy inside the
-# autograd graph. 60 steps converges the proxy eigenvalue tigthly enough for the
+# autograd graph. 60 steps converges the proxy eigenvalue tightly enough for the
 # regime loss at a fraction of the 200-step VRAM/deep-graph cost; override with
 # ``physics_loss.iterations`` in the train config (perf block).
 DEFAULT_PHYSICS_ITERATIONS = 60
 
 
 class EMA:
-    """Exponential moving average of the model weights (decay 0.9999)."""
+    """Exponential moving average of the model weights.
+
+    NOTE: at ``decay=0.9999`` over a 30k-step cosine-annealed run the shadow is a
+    10k-step average centred ~step 25k -- before the LR reaches 0 -- so it lags the
+    fully-annealed live weights into a less-converged region and generates
+    fragmented grids (~14% valid vs 92% live). Sample with ``--weights live``.
+    See ``PROJECT.md`` §8.
+    """
 
     def __init__(self, model: torch.nn.Module, decay: float):
         self.decay = decay
@@ -112,7 +120,7 @@ def _make_logger(backend: str, project: str, run_dir: Path, config: dict):
             wandb.init(project=project, config=config, dir=str(run_dir.parent), tags=tags)
             return (lambda tag, val, step: wandb.log({tag: val}, step=step),
                     lambda tag, img, step: wandb.log({tag: wandb.Image(img)}, step=step))
-        except Exception as e:  # noqa: BLE001 -- degraded-but-usable fallback
+        except Exception as e:  # degraded-but-usable fallback
             LOG.warning("wandb unavailable (%s); falling back to tensorboard", e)
     from torch.utils.tensorboard import SummaryWriter
     tb = SummaryWriter(log_dir=str(run_dir))
@@ -133,13 +141,24 @@ def _load_physics(lamb: float, device: torch.device, iterations: int):
     except ImportError:
         raise SystemExit(
             f"physics_loss.lambda_1 = {lamb} > 0 requires "
-            "src/losses/physics_loss.py (Option B, Week 7) and cannot run without it."
+            "src/losses/physics_loss.py (Option B, ROADMAP section 4.4) "
+            "and cannot run without it."
         ) from None
     return lambda x, c, t: connectivity_proxy_loss(x, c, t, iterations=int(iterations))
 
 
 def _resolve_physics_lambda(physics_cfg: dict, ablation: bool = False) -> float:
-    """Choose the Option-B baseline weight or its configured zero-loss control."""
+    """Choose the Option-B baseline weight or its configured zero-loss control.
+
+    Also enforces ``physics_loss.option``: only Option B is implemented, so an
+    ``option: A`` config must fail loudly instead of silently running B.
+    """
+    option = physics_cfg.get("option", "B")
+    if option != "B":
+        raise ValueError(
+            f"physics_loss.option = {option!r} is not supported; only Option B "
+            "is implemented (ROADMAP section 4.4, Option A is a contingency)"
+        )
     if not ablation:
         return float(physics_cfg.get("lambda_1", 0.0))
     ablation_cfg = physics_cfg.get("ablation", {})
@@ -273,6 +292,16 @@ def main() -> None:
 
     physics_cfg = tcfg.get("physics_loss", {})
     lamb = _resolve_physics_lambda(physics_cfg, ablation=args.physics_ablation)
+    if lamb > 0.0 and grad_clip <= 0.0:
+        # Footgun guard: the Option-B gradient has unbounded stochastic bursts
+        # (pre-clip norms in the thousands) and diverged the first full run
+        # without clipping; a config that omits grad_clip silently gets 0.0.
+        LOG.warning(
+            "physics_loss.lambda_1 = %g > 0 with optimizer.grad_clip = %g: "
+            "the first full run diverged under these settings; set "
+            "optimizer.grad_clip: 1.0 (see configs/train_baseline.yaml)",
+            lamb, grad_clip,
+        )
     physics = _load_physics(lamb, device,
                             int(physics_cfg.get("iterations",
                                                 DEFAULT_PHYSICS_ITERATIONS)))
@@ -285,6 +314,12 @@ def main() -> None:
                   "physics_ablation": bool(args.physics_ablation),
                   "physics_ablation_tag": physics_cfg.get("ablation", {}).get(
                       "tag", "abl_physics")}
+    # Snapshot the resolved config into the run dir. Without this, reproducing a
+    # run depends on the working tree at the time, which drifts: the divergence
+    # fix (grad_clip) landed after the first full run and is not recoverable from
+    # that run's checkpoint alone.
+    with (run_dir / "config.json").open("w", encoding="utf-8") as fh:
+        json.dump(run_config, fh, indent=2, default=str)
     log_scalar, log_image = _make_logger(
         tcfg["logging"]["backend"], tcfg["logging"]["project"], run_dir, run_config)
     ckpt_every = int(tcfg.get("checkpoint_every", 1000))
@@ -361,7 +396,7 @@ def main() -> None:
             if global_step % ckpt_every == 0:
                 torch.save({"model": model.state_dict(), "optim": opt.state_dict(),
                             "scheduler": sched.state_dict() if sched else None,
-                            "ema": {k: v for k, v in ema.shadow.items()} if ema else None,
+                            "ema": dict(ema.shadow) if ema else None,
                             "rng": _rng_state(), "iter": global_step}, run_dir / "ckpt.pt")
 
             if global_step % sample_every == 0 or global_step == max_iters:
@@ -389,7 +424,7 @@ def main() -> None:
     # final iteration is not aligned with checkpoint_every.
     torch.save({"model": model.state_dict(), "optim": opt.state_dict(),
                 "scheduler": sched.state_dict() if sched else None,
-                "ema": {k: v for k, v in ema.shadow.items()} if ema else None,
+                "ema": dict(ema.shadow) if ema else None,
                 "rng": _rng_state(), "iter": global_step}, run_dir / "ckpt.pt")
 
     LOG.info("training done at iter %d in %.1fs", global_step, time.time() - t_start)

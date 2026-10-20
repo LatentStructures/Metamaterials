@@ -14,7 +14,6 @@ from src.fea.homogenization import (
     set_base_material,
     set_void_scale,
     validate_vs_analytical,
-    void_scale,
 )
 from src.fea.property_extraction import (
     EffectiveProperties,
@@ -36,6 +35,5 @@ __all__ = [
     "set_base_material",
     "set_void_scale",
     "validate_vs_analytical",
-    "void_scale",
     "voigt_isotropic",
 ]

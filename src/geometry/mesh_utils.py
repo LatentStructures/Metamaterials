@@ -140,30 +140,70 @@ def periodic_pairing(tet_mesh: meshio.Mesh, resolution: int):
 # --------------------------------------------------------------------------- #
 # Smoothed surface (rendering / inspection only)
 # --------------------------------------------------------------------------- #
-def voxels_to_surface(voxels: np.ndarray, smooth: bool = True) -> meshio.Mesh:
+def voxels_to_surface(voxels: np.ndarray, smooth: bool = True,
+                      tiles: int = 1) -> meshio.Mesh:
     """Smooth marching-cubes surface mesh of the solid phase (not for FEA).
 
-    Periodic cells are never closed standalone bodies (they intersect the cell
-    faces); this surface is for inspection/rendering/logging only.
+    Periodic cells intersect their own faces, so a single tile extruded on its own
+    is an *open* surface: the level set has no "outside" beyond the box wall and
+    ``marching_cubes`` closes it along the wall with inverted winding. Both defects
+    are fixed by padding with void, which restores a two-sided distance field:
+
+    * winding is correct (signed volume positive; a known sphere came out at
+      -4205 before the sign fix vs +4189 after),
+    * the surface is closed, so ``--tiles 2`` exports a printable, watertight
+      2x2x2 block (ROADMAP 4.7). A single tile stays open at the faces that cut
+      through solid, which is inherent to a periodic cell, not an export bug.
+
+    Parameters
+    ----------
+    voxels:
+        Binary/solid occupancy grid, ``(res, res, res)``.
+    smooth:
+        ``True`` for a smoothed distance-field surface, ``False`` for a
+        faceted voxel-boundary surface.
+    tiles:
+        Replicate the cell this many times per axis before surfacing. ``1``
+        surfaces a single cell (open where solid crosses a face); ``>=2``
+        yields a closed, watertight block suitable for printing.
     """
     from scipy import ndimage
     from skimage.measure import marching_cubes
 
     voxels = np.asarray(voxels)
-    res = voxels.shape[0]
+    if tiles < 1:
+        raise ValueError(f"tiles must be >= 1, got {tiles}")
     binv = (voxels > 0).astype(np.int8)
     if binv.all() or not binv.any():
         raise RuntimeError("refusing to surface a fully solid / fully void voxel grid")
+    if tiles > 1:
+        binv = np.tile(binv, (tiles, tiles, tiles))
+    field_res = binv.shape[0]
+    # Pad with void: gives the distance transform an outside, so the level set
+    # closes at the outer boundary instead of being clipped by the array edge.
+    # A fully-void padding ring is what makes the tiled block watertight.
+    pad = 2
+    padded = np.zeros((field_res + 2 * pad,) * 3, dtype=np.int8)
+    padded[pad:-pad, pad:-pad, pad:-pad] = binv
+
+    # Sign convention: ``marching_cubes`` orients face winding from the direction
+    # of the field gradient, so the solid must sit on the *negative* side of the
+    # level set. Getting this backwards yields a geometrically correct but
+    # inside-out mesh with negated volume (the sphere check in
+    # ``tests/test_export.py`` catches it).
     if smooth:
-        dist_in = ndimage.distance_transform_edt(binv)
-        dist_out = ndimage.distance_transform_edt(1 - binv)
-        field = np.where(binv > 0, dist_in, -dist_out)
+        dist_in = ndimage.distance_transform_edt(padded)
+        dist_out = ndimage.distance_transform_edt(1 - padded)
+        field = np.where(padded > 0, -dist_in, dist_out)
         level = 0.0
     else:
-        field = binv.astype(float)
-        level = 0.5
+        field = -padded.astype(float)
+        level = -0.5
+
     verts, faces, _, _ = marching_cubes(field, level=level, spacing=(1.0, 1.0, 1.0))
-    verts = verts / res
+    # Undo the void padding and normalise by the *tiled* extent so each voxel is
+    # still 1/res of the output box regardless of tile count.
+    verts = (verts - pad) / field_res
     return meshio.Mesh(points=verts.astype(np.float64),
                        cells=[("triangle", faces.astype(np.int64))])
 

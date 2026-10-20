@@ -199,8 +199,8 @@ near-duplicate leakage across splits. Data binaries are gitignored.
 ## 6. Where things live
 
 ```
-configs/          One YAML per run type: dataset, model, two train profiles
-                  (baseline + 8 GB laptop), evaluate
+configs/          One YAML per run type: dataset, model, train (baseline),
+                  evaluate
 src/config.py     Config loaders + the locked conditioning-order check
 src/geometry/     Unit-cell generators, 32³ rasterization, mesh building
 src/fea/          FEniCSx homogenization, property extraction, benchmarks
@@ -213,7 +213,7 @@ src/train.py      Training loop (EMA, cosine LR, bf16, W&B/TensorBoard)
 src/sample.py     Conditional DDIM sampling → .npy / STL
 src/evaluate.py   FEA re-verification + filter + error report
 src/voigt.py      The single shared Voigt index convention
-tests/            118 passing tests + tests/smoke_test.py (env DoD; run it directly — pytest does not collect it)
+tests/            136 passing tests + tests/smoke_test.py (env DoD; run it directly — it contributes no pytest items)
 ```
 
 ## 7. Key decisions (locked — do not revisit)
@@ -236,39 +236,265 @@ tests/            118 passing tests + tests/smoke_test.py (env DoD; run it direc
 ## 8. Current status & what's left
 
 **Implemented and green:** the full pipeline is coded and tested — smoke test +
-118 pytest cases pass, `ruff` is clean. Geometry, FEA homogenization (validated
+136 pytest cases pass, `ruff` is clean. Geometry, FEA homogenization (validated
 against benchmarks), dataset writer/loader, U-Net, DDPM/DDIM, training loop,
 sampling, FEA-verified evaluation, synthesizability filter, and STL export all
-exist and work end-to-end on a smoke scale. The real dataset is **complete**:
+exist and work end-to-end at full scale. The real dataset is **complete**:
 `data/manifest.parquet` carries 2,400/2,400 cells (800 per family), split
 1,920/243/237 across train/val/test.
 
-**Remaining = production execution only:**
+**Trained baseline and acceptance result.** The retrain completed:
+`runs/baseline_clipfix_30k`, 30k iterations, 2 h 35 min, no divergence, with the
+divergence fix in place (`optimizer.grad_clip: 1.0`). Measured pre-clip gradient
+bursts peaked at ~1,577 early and up to **4,229** over iters 20k–30k; all were
+clipped and the loss held at
+0.005–0.04 through them. The first full run diverged under the same conditions
+without the clip (0/50 valid, loss climbing to ~1.7), so the clip is the
+validated fix; λ₁ stays at 0.05 and Option B is unchanged. That diverged run
+(`runs/diverged_*_DO_NOT_RESUME/`) has since been deleted as dead evidence; it is
+not needed to reproduce anything (the clip config reproduces the stable run).
 
-1. **Retrain the conditional DDPM** from a **fresh** run directory with
-   `configs/train_baseline.yaml` — or `configs/train_4060.yaml` on the 8 GB GPU
-   (identical except `batch_size` 16 vs 32 and the logging-project name)
-   (TensorBoard logging; run the λ₁ ablation
-   pair too). The first full run **diverged** (0/50 valid in the §7.1 eval):
-   the Option-B physics gradient has unbounded stochastic bursts (pre-clip
-   norms up to ~18) that dominate training after warmup. The validated fix is
-   `optimizer.grad_clip: 1.0`, now present in both train configs; λ₁ stays at
-   0.05 and Option B is unchanged. The dead run is kept at
-   `runs/diverged_baseline_physics_on_DO_NOT_RESUME/` — never `--resume-from`
-   it (details in `AGENTS.md`).
-2. **Acceptance run** (ROADMAP §7): ≥50 unseen targets → sample → FEA-verify →
-   report validity rate (≥90% target), reconstruction error (≤15% mean), and
-   R² (≥0.85); export top candidates to STL.
-3. Then the team can lock in a research-track differentiator.
+The §7.1 acceptance run (50 held-out targets, real FEA, **live** weights) passes:
+validity **92.0%** (46/50), 0 FEA failures, and reconstruction error
+E 3.63% / ρ 1.51% / ν 0.99% with R² 0.995 / 0.998 / 0.958. Export produced 5/5
+watertight STLs (`outputs/acceptance_30k/export_final`).
+
+**Memorization is ruled out by an off-manifold control.** Every one of the 50
+held-out targets is an exact dataset cell (distance 0.000000), and 25/50 generated
+samples had IoU > 0.9 against their source cell, so the acceptance numbers alone
+are partly circular. Repeating the run against **108 synthetic off-manifold
+targets** (built by `src/data/build_synthetic_targets.py`; ≥0.012 from any real
+cell) gives validity **97.2%** (105/108) with 0 FEA failures — validity does not
+collapse, so the model interpolates rather than recites. Errors degrade as they
+should when generalizing (E 3.6% → 13.8%, ν 1.0% → 1.5%), all inside ≤15%.
+
+> **⚠️ The off-manifold target set was rebuilt on 2026-10-20 to fix a builder bug.
+> Any off-manifold number dated before that (94.4% validity, ν R² 0.315, "variance
+> compression") came from the buggy set and is superseded — see
+> "Off-manifold target-set bug" below.**
+
+**Off-manifold target-set bug (found and fixed 2026-10-20).** The previous builder
+drew ν uniformly across each family's observed band, *independent of E and ρ*, then
+rejected a point only if it fell within `min_gap` of a real cell in 3-D `(E, ρ, ν)`.
+Because the ν displacement itself satisfied that gap test, the filter never caught
+the real problem: targets whose `(E, ρ)` sits essentially on a dataset cell while
+demanding a ν up to **0.11** away from that cell's actual ν. Real cells at the same
+`(E, ρ)` agree to 0.0000 — one `(E, ρ)` has exactly one ν — so **46 of 108 targets
+were physically unreachable**. A model cannot and should not emit them.
+
+This was originally mis-diagnosed as "variance compression, not error". Measurement
+refutes that diagnosis:
+
+* Fitting `ν ~ E + ρ` on each family gives R² = 0.87 / 0.99 / 0.93 with residual
+  std 0.0117 / 0.0012 / 0.0018 — ν is a *near-deterministic function* of `(E, ρ)`,
+  so the information was always available to the model.
+* 80% of the target-set ν variance is *within*-family, so "the bands barely overlap"
+  was never the main effect.
+* Building the targets physically (`--nu-jitter`, ν drawn from the fitted relation
+  plus residual-scale scatter) improves off-manifold ν from **7.18% error /
+  R² 0.315** to **1.48% / R² 0.858** — a 4.9× error reduction and the gate now
+  passes. Nothing about the model changed; only the targets stopped being impossible.
+
+A regression test (`test_targets_are_physically_reachable`) now fails the old
+builder's output in all three families, so this cannot recur silently.
+
+**One criterion still misses off-manifold, and it is a spread artifact.** E R² is
+**0.808** on the physical target set against the ≥0.85 target, while E's *error* is
+13.75% — comfortably inside the ≤15% gate. The cause is measured: E R² is
+`1 − MSE/var(target_E)`, and the honest set spans a **narrower E range** than the
+artificial one (std 0.0511 vs 0.0712). The model's *fractional* E error is
+essentially the same on both sets (RMSE 0.156 vs 0.153 of the E level); applying the
+physical set's own fractional error profile to the old set's wider spread raises
+E R² from 0.822 to **0.866**. So spread accounts for the bulk of the gap — the old
+0.926 was partly an artifact of targets that existed only because ν was drawn at
+random. Net: on the physical set the E error gate passes and the E R² gate misses by
+0.04.
+
+**Error bar (108 targets × 5 draws = 540 FEA evaluations):** validity
+**92.2%** (498/540), 0 FEA failures, 95% CI **[90.0%, 94.5%]** — the criterion is
+met but with almost no margin, so 92% should be quoted with its interval rather
+than as a point. Failures are not uniform noise: **93/108 targets succeed 5/5** and
+4 targets fail 0/5, so the model is highly reliable on most of the space and
+genuinely fails on a few hard off-manifold corners. Because the draws are not
+independent, the target-level interval (±4.4 pts) is the honest one for "can this
+hit arbitrary targets".
+
+> **Note:** this 540-sample run predates the target-set fix, so it used the
+> unreachable targets and its E/ν error figures (10.58% / 7.34%) are inflated.
+> The **validity rate and its interval are unaffected in direction** — the corrected
+> set scores slightly *higher* (97–98%) — but a re-run on the physical set would
+> tighten the record. Treat 92.2% as a conservative lower bound.
+
+**Remaining:**
+
+1. **λ₁ = 0 ablation** — **done** (`runs/baseline_physics_off`); it matched or beat
+   the physics-on baseline on every metric, see below. **Followed up off-manifold
+   (done, on the corrected target set):** validity 98.1% vs 97.2%, E 12.36% vs
+   13.75%, ν 1.17% vs 1.48% — physics-off leads on validity, E and ν, and both arms
+   now pass the ν R² gate (0.931 vs 0.858). A second seed would still firm it up.
+2. **Error bar on the validity rate** — **done**: 92.2% (498/540, 108 targets × 5 draws),
+   95% CI [90.0%, 94.5%]. Re-run only if more draws are needed to tighten it.
+3. **EMA arm** — **diagnosed and closed** (see below); it is a decay/schedule
+   mis-scaling, not a broken average. **`--weights live` is now the sampler
+   default** and the arm used for every number above.
+4. **Commit the working tree** — everything above is uncommitted; the branch is
+   `fix/physics-grad-clip` at `70ab07a` with PR #2 open.
+5. Then the team can lock in a research-track differentiator.
+
+### The EMA arm: root cause and resolution
+
+The EMA weights score **14.0%** (7/50) with one FEA solver failure versus **92.0%**
+for the live weights. That gap is now fully explained, and it is a **config-scaling
+artefact, not a defect in the EMA implementation or in the model**.
+
+What was ruled out:
+
+- **Not a broken/stale average.** The shadow holds all 126 parameter keys and is a
+  genuine running mean: `‖EMA − live‖ / ‖live‖ = 0.052`, `cos(EMA, live) ≈ 1.0003`.
+- **Not model-specific.** The physics-**off** checkpoint — a measurably better model —
+  fails identically under its own EMA weights (mean **9.34** connected components,
+  29/50 fragmented) while its live weights stay clean (1.62). So the effect is
+  independent of which run produced the weights.
+- **Not generic sensitivity to a 5% weight change.** Perturbing the live weights with
+  isotropic Gaussian noise at the *same* relative magnitude (5.2%) leaves geometry
+  clean (1.54 components vs live 1.62).
+
+What it is — a **dose–response along the live→EMA direction**. Interpolating the
+checkpoint's weights gives a monotonic fragmentation curve:
+
+| α (0 = live, 1 = EMA) | mean connected components | fragmented samples |
+|---|---|---|
+| 0.00 | 1.62 | 15/50 |
+| 0.25 | 1.72 | 17/50 |
+| 0.50 | 3.40 | **33/50** |
+| 0.75 | 4.90 | 39/50 |
+| 1.00 | 11.50 | 44/50 |
+
+**Mechanism.** `decay = 0.9999` gives an effective averaging window of
+`1/(1 − decay) = 10,000` steps, centred ~step 25,000 of a 30,000-step run. But the
+cosine schedule uses `T_max = 30000, eta_min = 0.0`, so the live weights are annealed
+to **lr = 0.0** at the final step, and the training loss is still falling steeply there
+(1.63e-2 at step 27k → 5.16e-3 at step 30k). The EMA therefore averages over a
+**less-converged region** of the trajectory; moving even halfway toward it doubles the
+fragment rate, and the periodic-connectivity filter then correctly rejects those
+grids — hence 14%.
+
+**Resolution.** The sampler default is now `--weights live` (`src/sample.py`), and the
+mis-scaling is flagged in `configs/train_baseline.yaml` and the `EMA` class docstring.
+The EMA arm remains available via `--weights ema` for the documented A/B. A properly
+scaled decay (~0.999, window ~1,000 steps centred near step 29.5k) would keep the EMA
+inside the annealed region; validating that is a research-track nicety, not a baseline
+requirement, since every reported number already uses live weights.
+
+### ROADMAP §7.2 lock-in status
+
+| checklist item | status |
+|---|---|
+| Dataset reproducible from a fixed seed | ✅ config-driven, seed 0, resumable checkpoints |
+| FEA validated vs analytical benchmarks (≤5%) | ✅ smoke test 5.6e-15 rel. error; benchmark tests in suite |
+| Trains stably, non-degenerate samples | ✅ 30k run no divergence; generated solid-fraction/diversity spread matches the dataset's |
+| R² ≥ 0.85 and validity ≥ 90% on held-out | ⚠️ validity **92.0%** (50 held-out) and **92.2% [90.0–94.5% CI]** off-manifold, 0 FEA failures — criterion met but with little margin; off-manifold **ν R² = 0.858 ✅** and ρ ✅, but **E R² = 0.808 misses** by 0.04 (E *error* 13.8%, inside ≤15%; the R² gap is target-spread, see above) |
+| ≥1 candidate exported to STL, visually inspected | ✅ 5/5 watertight (`outputs/acceptance_30k/export_final`), inspected by a team member |
+| All four members can run the pipeline from a clean checkout | ⏳ team side |
+| Supervisor sign-off | ⏳ team side |
+
+**λ₁ = 0 ablation (the control):** trained identically except λ₁ = 0
+(`runs/baseline_physics_off`, 30k iters, config snapshot confirms
+`lambda_1: 0.0`). This is the evidence about whether the Option-B physics loss
+earns its place, and it does **not** support it on any metric measured:
+
+| metric | physics-ON (λ₁=0.05) | physics-OFF (λ₁=0) |
+|---|---|---|
+| §7.1 validity, 50 held-out | 92.0% | **94.0%** |
+| FEA solver failures | 0 | 0 |
+| E mean error / R² | 3.63% / 0.9954 | **2.44% / 0.9979** |
+| ρ mean error / R² | 1.51% / 0.9978 | **1.30% / 0.9981** |
+| ν mean error / R² | 0.99% / 0.9584 | **0.56% / 0.9898** |
+| final loss (mean, last 5k) | 0.0118 | **0.0033** |
+| max pre-clip grad, iters 20k–30k | **4,229** | 1.31 |
+| post-warmup grad excursions >1 | 12 | 2 |
+
+**The ablation was also re-evaluated on the 108 off-manifold targets** — the
+discriminating control, where the physics loss has the best chance to earn its
+place, since these are the points with no exact dataset cell to copy
+(`outputs/ablation_30k/evaluate_synthetic`, same physical target set and recipe as
+`outputs/synthetic_30k/evaluate`):
+
+| metric, 108 off-manifold targets | physics-ON (λ₁=0.05) | physics-OFF (λ₁=0) |
+|---|---|---|
+| validity | 97.2% (105/108) | **98.1% (106/108)** |
+| FEA solver failures | 0 | 0 |
+| E mean error / R² | 13.75% / 0.8083 | **12.36% / 0.8491** |
+| ρ mean error / R² | **1.84%** / 0.9878 | 2.15% / 0.9815 |
+| ν mean error / R² | 1.48% / 0.8577 | **1.17% / 0.9305** |
+
+The validity comparison is effectively even: a paired per-target check shows
+**0 targets valid under physics-on only and 1 under physics-off only, with 107
+agreeing**. Physics-off leads on validity, E and ν (ρ goes slightly the other way).
+So off-manifold the physics loss does not pay for itself, and physics-off still
+edges ahead on the majority of metrics. This also removes the strongest version of
+the off-manifold caveat: the loss is not merely "unjustified on the easy on-manifold
+targets", it is unjustified on the hard ones too.
+
+Two conclusions. First, the physics gradient is confirmed as the source of the
+instability: iters 1–1000 are bit-identical between the two runs (5.905) because
+λ₁ warms from 0, and once it activates the physics-on run spikes to 4,229 while
+physics-off never exceeds 1.31 — so `grad_clip` is necessary *because of* the
+physics term. Second, the physics term did not improve validity or any property
+metric; the control matched or beat it everywhere, on the same 50 targets, same
+seed, same schedule. With 50 samples the validity gap (92 vs 94) is inside noise,
+but the property errors and R² are better for physics-off consistently across all
+three properties, and the loss is 3.6× lower.
+
+This is a finding for the §7.2 review, not a defect: it means the baseline's
+headline numbers are achievable with the diffusion loss alone, and any claim that
+the physics-informed loss is necessary needs a different experiment before it can
+be made — the off-manifold evaluation above has now been run and does not restore
+it, so what remains is a second seed, a reduced-data regime, or a different
+physics formulation.
+
+**How this verdict should be read (scoping, not science).** `ROADMAP.md` §7.2
+commits the baseline only to the ablation being **documented, even if the effect is
+small** — it does not commit to the loss *working*. On that reading the baseline
+obligation is fully met: the control was trained, evaluated on-manifold and
+off-manifold, and is reported here with its mechanism and its error bars. What the
+ablation does **not** support is any claim that Option B is *necessary* or
+*beneficial* at λ₁ = 0.05 on this architecture, and the honest statement is that the
+evidence points the other way. Interpretations that go further — "Option B is broken
+as specified", "λ₁ is mis-tuned", "a connectivity penalty cannot steer an ε-MSE
+DDPM" — each require experiments this baseline does not contain (a λ sweep, a second
+seed, an alternative formulation), so they are **research-track hypotheses**, not
+baseline conclusions. Lead with the scoping reading; it is the only one defensible
+from one seed at one λ, and it still leaves the project's central claim intact: the
+conditional diffusion model inverts the design targets to ≥90% synthesizable
+geometry, with or without the physics term.
+
+**Mechanism (wall thickness).** The physics-on arm produces measurably more thin
+wall: mean thin-voxel fraction 0.0472 vs 0.0450, and paired across the same 50
+targets, **37 targets are thinner under physics-on vs 11 under physics-off**
+(Wilcoxon signed-rank p = 0.0015; p = 0.0040 excluding the three pathological
+low-density targets). This is consistent with the Option-B connectivity proxy
+rewarding connectedness, since thin struts are the cheapest way to stay connected
+at low density — so the physics loss appears to buy connectivity by spending wall
+thickness, a trade with no net benefit given the filter already enforces
+`min_wall_voxels: 2`. It also matches the failure modes: all 4 physics-on failures
+and all 3 physics-off failures were `min_wall_thickness`. Caveat: thin-ness in
+both arms is strongly anti-correlated with target density (r ≈ −0.43), and the
+worst cases are the *same* low-density targets in both arms, so part of the raw
+gap is target difficulty rather than model behaviour — the paired test is what
+establishes the per-target difference. Note also that thinner walls at equal
+density are not unambiguously "better": they carry less material per member, which
+only a mechanical test, not the validity filter, could adjudicate.
 
 ## 9. Get running
 
 ```sh
 export MAMBA_ROOT_PREFIX=$PWD/.mamba
 micromamba run -n metamaterials python tests/smoke_test.py     # env check
-micromamba run -n metamaterials python -m pytest tests -q      # 118 tests
+micromamba run -n metamaterials python -m pytest tests -q      # 136 tests
 micromamba run -n metamaterials ruff check src tests           # lint
 ```
 
-See `README.md` for the full setup (micromamba + conda env + CUDA torch) and
-the five command-line entry points.
+`RuntheBaseline.md` is the end-to-end walkthrough (dataset → train → sample →
+evaluate → export). See `README.md` for setup (micromamba + conda env + CUDA
+torch) and the five command-line entry points.
