@@ -1,7 +1,7 @@
 """Tests for the off-manifold target builder (src/data/build_synthetic_targets.py).
 
 ``data/targets_synthetic.csv`` is the source of the headline off-manifold
-control (SESSION_EXPORT section 5.4), so the builder must be deterministic, keep
+control, so the builder must be deterministic, keep
 every target a safe distance from real cells, interpolate only inside a family's
 realizable band **and keep nu physically consistent with (E, rho)** — see
 ``test_targets_are_physically_reachable`` for why that last property matters —

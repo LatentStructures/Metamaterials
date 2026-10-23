@@ -1,0 +1,63 @@
+# Phase 2 training run config for the CORRECTED dataset (data/v1f/).
+#
+# Identical to configs/train_baseline.yaml except for the data file: the
+# corrected dataset drops the 296 rows that fail the synthesizability filter
+# and evens out the rasterization duplication inside every (split, family)
+# cell. Row count, split sizes, family balance, conditioning order, seed,
+# optimizer, EMA and the physics loss are unchanged, so a v1f run is directly
+# comparable to the v1 run it is matched against.
+#
+# Derived by scripts/derive_corrected_dataset.py -- zero FEA: the FEA labels
+# are copied bit-for-bit from the v1 checkpoint.
+# Phase 2 training run config (ROADMAP.md Phase 2, Section 4.5; Section 5).
+# No hyperparameters are hardcoded in scripts — this file is the source.
+seed: 0
+data:
+  hdf5: data/v1f/dataset_train.h5
+  min_samples: 1600                              # at least the 80% train share of 2,000 valid cells
+                                                 # (v1f train split: 1,920 rows / 604 unique grids)
+  conditioning_order: [E, relative_density, nu]   # must match manifest + HDF5 /conditioning_vector (Phase 1, Section 3.4)
+  augmentation: true                              # random proper rotation per sample (the 24 cube rotations; no mirrors, Section 3.4)
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  lr_schedule: cosine                            # cosine decay (Phase 2, Section 4.5)
+  grad_clip: 1.0                                 # global-norm clip; bounds the Option-B physics-gradient
+                                                 # spikes (pre-clip norms ~1,577 early, up to 4,229 over
+                                                 # iters 20k-30k) that otherwise
+                                                 # destabilize training post-warmup -- validated by the
+                                                 # 5k-step overfit A/B/C ladder (lambda=0.05+clip matches
+                                                 # lambda=0 convergence and generation; lambda reduction
+                                                 # alone does not)
+ema:
+  enabled: true
+  decay: 0.9999                                  # Primary legacy-compatible EMA choice. The old
+                                                 # single-decay run gave 14% validity vs 92% live;
+                                                 # the current run tracks all three listed decays with
+                                                 # warmup and must evaluate them before selecting one.
+  decays: [0.999, 0.9995, 0.9999]                # track candidate horizons for post-run validation
+batch_size: 32                                   # 32³ at batch 32 fits the 8 GB training GPU (RTX 4060,
+                                                  # validated by the 30k run); reduce on smaller cards
+mixed_precision: bf16                            # bf16 preferred where supported
+epochs: 500                                     # tuned budget to hit deadline; overridden by --overfit
+checkpoint_every: 500
+perf:                                             # GPU throughput knobs (src/train.py)
+  cudnn_benchmark: true                           # fixed 32³ shapes amortize the cuDNN autotune
+  tf32: true                                      # TF32 tensor cores
+  float32_matmul_precision: high                  # -> torch.set_float32_matmul_precision("high")
+  num_workers: 8                                  # host RAM keeps 8 workers fed; GPU is CPU-bound otherwise
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: true
+physics_loss:                                    # Option B only (Phase 2, Section 4.4); Option A is a contingency
+  option: B
+  lambda_1: 0.05                               # physics-on baseline run; initial value for ablation (Phase 2, Section 4.4)
+  iterations: 60                                 # power-iteration budget inside the autograd graph (perf/VRAM trade-off)
+  warmup_fraction: 0.2                           # λ₁ warmed from 0 over first 20% of training
+  ablation: {lambda_1: 0.0, tag: abl_physics}    # invoke with --physics-ablation (Phase 2, Section 4.4)
+logging:
+  backend: tensorboard                            # view via: python -m tensorboard --logdir runs
+  project: metamaterials-baseline
+  sample_interval: 5000

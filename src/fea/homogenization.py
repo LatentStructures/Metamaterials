@@ -24,6 +24,7 @@ the batch runner in ``generate_dataset.py`` stay in lockstep:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Iterable
 
@@ -56,7 +57,10 @@ _VOID_SCALE = 1e-6
 # baseline prototype scales poorly on the 32^3 lattice (~1e5 kept dofs, minutes
 # per cell).  Voxel-homogenization practice (Dong et al. 2018; ParFE, bone
 # micro-FE, FANS) solves with preconditioned CG: with a Jacobi diagonal the
-# res-32 solve drops to ~1-2 s/cell (measured ~1.5 s vs >10 min for splu).
+# Dataset-v2's full generation averaged 85.5 s/cell (p95 126 s, max 170 s).
+# A 2026-10-21 six-cell replay measured 12.1-29.3 s/cell on this machine;
+# CG dominates both profiles, so these selected cells are not a replacement
+# for the full-run timing. Do not treat the old ~1.5 s estimate as representative.
 _CG_RTOL = 1e-6
 _CG_MAXITER = 5000
 
@@ -233,12 +237,15 @@ class _Problem:
         stress = (2.0 * self.mu * (self._ebar + eps(self._uh))
                   + self.lam * ufl.tr(self._ebar + eps(self._uh)) * ufl.Identity(3))
         self._stress_forms = [fem.form(stress[a, b] * ufl.dx) for (a, b) in VOIGT_PAIRS]
+        self.last_profile: dict = {}
 
     # ------------------------------------------------------------------ #
 
     def _solve_once(self, voxels: np.ndarray) -> tuple[np.ndarray, float]:
         """Assemble, factorize and solve all 6 load cases; return (C6, wall_seconds)."""
-        t0 = time.time()
+        t0 = time.perf_counter()
+        profile: dict[str, object] = {"load_cases": []}
+        profile_enabled = os.environ.get("METAMATERIALS_PROFILE_FEA") == "1"
         solid = np.asarray(voxels, dtype=bool).reshape(-1)
         E_s, nu_s = base_material()
         E_v = _VOID_SCALE * E_s
@@ -248,11 +255,17 @@ class _Problem:
         lam_v = E_v * nu_s / ((1.0 + nu_s) * (1.0 - 2.0 * nu_s))
 
         cell_solid = solid[self.cell_voxel]
+        phase_t = time.perf_counter()
         self.mu.x.array[:] = np.where(cell_solid, mu_s, mu_v)
         self.lam.x.array[:] = np.where(cell_solid, lam_s, lam_v)
+        profile["material_assignment_s"] = time.perf_counter() - phase_t
 
+        phase_t = time.perf_counter()
         A = fem.assemble_matrix(self._a).to_scipy().tocsr()
+        profile["assemble_matrix_s"] = time.perf_counter() - phase_t
+        phase_t = time.perf_counter()
         A_cond = ((self._L @ (A @ self._L.T))[self.kept][:, self.kept]).tocsc()
+        profile["condense_s"] = time.perf_counter() - phase_t
 
         C6 = np.zeros((6, 6))
         # Jacobi-preconditioned CG, cold-started per load case.  (Warm
@@ -262,18 +275,38 @@ class _Problem:
         diag = np.where(np.abs(diag) < 1e-14, 1.0, diag)
         M = sp.diags(1.0 / diag)
         for k, ebar_t in enumerate(_UNIT_TENSORS):
+            case_profile: dict[str, float | int] = {"case": k}
             self._ebar.value = ebar_t
+            phase_t = time.perf_counter()
             b = np.asarray(fem.assemble_vector(self._Lf).array, dtype=float)
             rhs = (self._L @ b)[self.kept]
+            case_profile["assemble_rhs_s"] = time.perf_counter() - phase_t
+            iterations = 0
+
+            def _count_iteration(_x) -> None:
+                nonlocal iterations
+                iterations += 1
+
+            phase_t = time.perf_counter()
             x, info = cg(A_cond, rhs, M=M,
-                         rtol=_CG_RTOL, atol=1e-40, maxiter=_CG_MAXITER)
+                         rtol=_CG_RTOL, atol=1e-40, maxiter=_CG_MAXITER,
+                         callback=_count_iteration if profile_enabled else None)
+            case_profile["cg_s"] = time.perf_counter() - phase_t
+            case_profile["cg_iterations"] = iterations
             if info != 0:
                 raise RuntimeError(
                     f"CG failed to converge on load case {k} (info={info}); "
                     "the condensed system is (near-)singular")
 
+            phase_t = time.perf_counter()
             self._expand_solve(x, k, ebar_t, C6)
-        return C6, time.time() - t0
+            case_profile["integrate_stress_s"] = time.perf_counter() - phase_t
+            profile["load_cases"].append(case_profile)
+        profile["total_s"] = time.perf_counter() - t0
+        self.last_profile = profile
+        if profile_enabled:
+            LOG.info("FEA solve profile: %s", profile)
+        return C6, float(profile["total_s"])
 
     def _expand_solve(self, x: np.ndarray, k: int,
                       ebar_t: np.ndarray, C6: np.ndarray) -> None:

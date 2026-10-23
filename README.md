@@ -1,4 +1,5 @@
 # Metamaterials
+
 Physics-informed conditional diffusion for inverse design of synthesizable mechanical metamaterials (voxel + 3D U-Net + FEniCSx homogenization).
 
 **Results:** see `outputs/README.md` for the headline numbers (92.0% on-manifold, 97.2% off-manifold, 94.0%/98.1% λ₁=0 ablation) and which files hold the sample grids, parity plots and printable STLs. The full write-up is `PROJECT.md`; the step-by-step runbook is `RuntheBaseline.md`.
@@ -13,6 +14,7 @@ Physics-informed conditional diffusion for inverse design of synthesizable mecha
    curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
    install -m 755 bin/micromamba ~/.local/bin/micromamba
    ```
+
 2. Create the environment. For a repo-local env (gitignored via `.mamba/`):
 
    ```sh

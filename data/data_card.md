@@ -6,6 +6,7 @@
 - **generation date**: 2026-10-19 00:17:57
 - **total records**: 2400 (failed/skipped: 0)
 - **unique voxel grids**: 1023
+- **manifest voxel paths**: repository-relative (portable across checkout locations)
 - **wall time (FEA)**: 11251.4s
 
 ## FEA configuration
@@ -42,6 +43,27 @@
 - connectivity is counted **periodically** (components merged across
   wrapped faces); the unwrapped count is far lower and is wrong for
   unit cells.
-- cubic_strut: 86.9% (695/800)
-- gyroid: 86.8% (694/800)
-- octet_truss: 89.4% (715/800)
+- cubic_strut: 100.0% (800/800)
+- gyroid: 75.4% (603/800)
+- octet_truss: 87.6% (701/800)
+- per-family breakdown recomputed 2026-10-21 with the committed filter
+  (`evaluate_validity` as called by `_validity_summary`): all 296 failures
+  are `min_wall_thickness`; zero connectivity and zero overhang failures.
+  Overall total is unchanged.
+
+## Effective diversity
+- unique voxel grids: 1,023 of 2,400 rows (cubic 515/800, gyroid 368/800,
+  octet 140/800). Duplicate rows are byte-identical grids with identical
+  labels — loss re-weightings, not label noise — and none span more than one
+  split. Full analysis: `FINDINGS.md` §3.1.
+
+## Corrected copy: `data/v1f/`
+A derived, gate-only-corrected copy of this dataset drops the 296
+filter-invalid rows above and evens the per-(split × family) grid-multiplicity
+skew, yielding a **100%-valid** dataset with the same 2,400 rows, the same
+splits, and the same 800-per-family balance — at the cost of unique-grid
+count (**935** vs 1,023 here). Labels were copied bit-for-bit; **no FEA was
+re-run**. See `data/v1f/data_card.md` for the derivation, and note its
+conditioning statistics differ, so sampling a V1f checkpoint requires
+`--train-config configs/train_baseline_v1f.yaml`. This v1 copy remains the
+ground truth for satisfiability verdicts and the historical pipeline.

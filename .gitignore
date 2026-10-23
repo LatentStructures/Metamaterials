@@ -22,6 +22,12 @@ data/checkpoints/
 *.npz
 *.stl
 
+# The golden-cell regression fixture is source, not a generated artifact: it is
+# a small, checked-in reference tensor set that the FEA replay test needs on a
+# clean checkout.
+!tests/fixtures/
+!tests/fixtures/*.npz
+
 # --- Training and evaluation artifacts ---
 runs/
 outputs/
@@ -31,9 +37,7 @@ wandb/
 events.out.tfevents.*
 
 # --- Selectively tracked results (override the blanket `outputs/` rule above) ---
-# Commit the three headline result dirs + the flagged stale report; keep
-# `outputs/samples/` (pre-fix scratch) and `runs/` (186 MB checkpoints, over
-# GitHub's 100 MB limit) ignored.
+# Track only headline legacy results + stale evidence report; keep experiments/audits local.
 # A file cannot be re-included while an ancestor is excluded, so un-ignore the
 # `outputs/` dir first, then re-include per file type (later rules win).
 !outputs/
@@ -45,6 +49,21 @@ outputs/*
 !outputs/evaluate/
 outputs/samples/
 outputs/diag/
+outputs/final_acceptance/
+outputs/final_acceptance_v1f/
+outputs/ema_validation/
+outputs/filter_timing/
+outputs/audit/
+outputs/acceptance_30k/evidence/
+outputs/audit_clamp*/
+outputs/audit_sampling_batch/
+outputs/*_profile*
+outputs/fea_profile.json
+outputs/training_profile.*
+outputs/physics_precision.json
+outputs/physics_proxy_sanity.json
+outputs/data_generated_validity.json
+outputs/audit_clamp_summary.json
 
 # Do NOT use `!outputs/<dir>/**`: it re-includes every type, leaking the `.npy`
 # grids back in. Un-ignore per type instead so the `*.npy` rule above holds.
@@ -88,3 +107,4 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+scripts/

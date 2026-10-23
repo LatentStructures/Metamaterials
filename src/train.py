@@ -14,12 +14,12 @@ import logging
 import random
 import time
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch import optim
-from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from src.config import REPO_ROOT, check_conditioning_order, load_yaml, set_seed
@@ -39,35 +39,91 @@ DEFAULT_PHYSICS_ITERATIONS = 60
 class EMA:
     """Exponential moving average of the model weights.
 
-    NOTE: at ``decay=0.9999`` over a 30k-step cosine-annealed run the shadow is a
-    10k-step average centred ~step 25k -- before the LR reaches 0 -- so it lags the
-    fully-annealed live weights into a less-converged region and generates
-    fragmented grids (~14% valid vs 92% live). Sample with ``--weights live``.
-    See ``PROJECT.md`` §8.
+    The historical single-shadow ``decay=0.9999`` run over a 30k-step cosine
+    schedule scored 14% validity versus 92% for live weights. Current training
+    tracks several decays with warmup; their validity must be measured before a
+    preferred shadow is selected. See ``PROJECT.md`` §8.
     """
 
-    def __init__(self, model: torch.nn.Module, decay: float):
-        self.decay = decay
-        self.shadow = {k: v.detach().clone().float() for k, v in model.state_dict().items()}
+    def __init__(self, model: torch.nn.Module, decay: float,
+                 decays: list[float] | None = None):
+        self.decay = float(decay)
+        self.decays = sorted({float(d) for d in (decays or [decay])})
+        if self.decay not in self.decays:
+            self.decays.append(self.decay)
+        if any(not 0.0 <= d < 1.0 for d in self.decays):
+            raise ValueError(f"EMA decays must be in [0, 1), got {self.decays}")
+        self.updates = 0
+        initial = {k: v.detach().clone().float() for k, v in model.state_dict().items()}
+        self.shadows = {self._key(d): {k: v.clone() for k, v in initial.items()}
+                        for d in self.decays}
+
+    @staticmethod
+    def _key(decay: float) -> str:
+        return f"{float(decay):.6f}".rstrip("0").rstrip(".")
+
+    @property
+    def shadow(self) -> dict[str, torch.Tensor]:
+        """Legacy alias for the configured primary decay shadow."""
+        return self.shadows[self._key(self.decay)]
+
+    @shadow.setter
+    def shadow(self, state: dict[str, torch.Tensor]) -> None:
+        self.shadows[self._key(self.decay)] = state
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module) -> None:
-        for k, v in model.state_dict().items():
-            self.shadow[k].mul_(self.decay).add_(v.detach().float(), alpha=1.0 - self.decay)
+        self.updates += 1
+        state = model.state_dict()
+        values = [v.detach().float() for v in state.values()]
+        for decay in self.decays:
+            # Standard early-step warmup prevents the shadow from being
+            # initialized as an over-smoothed copy before enough updates exist.
+            effective = min(decay, (1.0 + self.updates) / (10.0 + self.updates))
+            shadow = self.shadows[self._key(decay)]
+            tensors = list(shadow.values())
+            torch._foreach_mul_(tensors, effective)
+            torch._foreach_add_(tensors, values, alpha=1.0 - effective)
 
     @torch.no_grad()
-    def apply(self, model: torch.nn.Module) -> None:
-        model.load_state_dict({k: v.float() for k, v in self.shadow.items()}, strict=True)
+    def apply(self, model: torch.nn.Module, decay: float | None = None) -> None:
+        selected = self.decay if decay is None else float(decay)
+        key = self._key(selected)
+        if key not in self.shadows:
+            raise ValueError(f"EMA decay {selected} is not tracked; available: {self.decays}")
+        model.load_state_dict({k: v.float() for k, v in self.shadows[key].items()}, strict=True)
 
     @contextmanager
-    def average_parameters(self, model: torch.nn.Module):
-        """Temporarily apply EMA parameters and restore live weights on exit."""
-        raw = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        self.apply(model)
+    def average_parameters(self, model: torch.nn.Module, decay: float | None = None):
+        """Swap EMA tensor storage in temporarily without cloning live weights."""
+        selected = self.decay if decay is None else float(decay)
+        key = self._key(selected)
+        if key not in self.shadows:
+            raise ValueError(f"EMA decay {selected} is not tracked; available: {self.decays}")
+        tensors = dict(model.named_parameters())
+        tensors.update(dict(model.named_buffers()))
+        shadow = self.shadows[key]
+        if tensors.keys() != shadow.keys():
+            raise ValueError("EMA state keys do not match the model state")
+        live_data = {name: tensor.data for name, tensor in tensors.items()}
+        for name, tensor in tensors.items():
+            tensor.data = shadow[name].to(device=tensor.device, dtype=tensor.dtype)
         try:
             yield
         finally:
-            model.load_state_dict(raw, strict=True)
+            for name, tensor in tensors.items():
+                tensor.data = live_data[name]
+
+
+def _ema_checkpoint_fields(ema: EMA | None) -> dict:
+    """Serialize the primary EMA and all tracked decay shadows weights-only safe."""
+    if ema is None:
+        return {"ema": None, "ema_shadows": None, "ema_updates": 0}
+    return {
+        "ema": dict(ema.shadow),
+        "ema_shadows": {key: dict(value) for key, value in ema.shadows.items()},
+        "ema_updates": ema.updates,
+    }
 
 
 def _rng_state() -> dict:
@@ -190,6 +246,35 @@ def _make_augment(enabled: bool, seed: int) -> VoxelTransform | None:
     return transform
 
 
+@lru_cache(maxsize=8)
+def _rotation_permutations(resolution: int, device: torch.device) -> torch.Tensor:
+    """Return the 24 exact flat-index permutations for proper cube rotations."""
+    from src.data.augment import _ROTATIONS, rotate_voxels
+
+    indices = np.arange(resolution ** 3, dtype=np.int64).reshape(
+        resolution, resolution, resolution)
+    return torch.as_tensor(np.stack([
+        rotate_voxels(indices, rotation).reshape(-1) for rotation in _ROTATIONS
+    ]), dtype=torch.long, device=device)
+
+
+def _augment_batch(x: torch.Tensor, seed: int, epoch: int, step: int) -> torch.Tensor:
+    """Apply reproducible, epoch-varying proper rotations on the batch device."""
+    if x.ndim != 5 or x.shape[1] != 1 or len(set(x.shape[2:])) != 1:
+        raise ValueError(f"expected (B,1,D,D,D) voxels, got {tuple(x.shape)}")
+    gen = torch.Generator(device=x.device)
+    gen.manual_seed((int(seed) + epoch * 1_000_003 + step * 97_409) % (2**63 - 1))
+    rotations = torch.randint(24, (x.shape[0],), generator=gen, device=x.device)
+    return _apply_rotation_indices(x, rotations)
+
+
+def _apply_rotation_indices(x: torch.Tensor, rotations: torch.Tensor) -> torch.Tensor:
+    """Apply an explicit rotation index per sample (useful for validation)."""
+    perms = _rotation_permutations(x.shape[-1], x.device)[rotations.to(x.device)]
+    flat = x.flatten(2)
+    return torch.gather(flat, 2, perms.unsqueeze(1).expand(-1, 1, -1)).reshape_as(x)
+
+
 def _clip_grad(model: torch.nn.Module, max_norm: float | None) -> float | None:
     """Config-driven global gradient norm clipping (``optimizer.grad_clip``).
 
@@ -210,6 +295,12 @@ def _parse():
                     help="architecture test: train on N samples only (section 4.2)")
     ap.add_argument("--max-iterations", type=int, default=0, help="0 = run to completion")
     ap.add_argument("--resume-from", default=None)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="override train-config seed for reproducible seed replicates")
+    ap.add_argument("--lambda-1", type=float, default=None,
+                    help="override the active physics-loss lambda (including ablation arm)")
+    ap.add_argument("--ema-decay", type=float, default=None,
+                    help="override ema.decay without editing a config copy")
     ap.add_argument("--physics-ablation", action="store_true",
                     help="run the configured lambda_1=0 Option-B ablation")
     return ap.parse_args()
@@ -221,6 +312,16 @@ def main() -> None:
 
     tcfg = load_yaml(args.train_config)
     mcfg = load_yaml(args.model_config)
+    if args.seed is not None:
+        tcfg["seed"] = args.seed
+    if args.ema_decay is not None:
+        tcfg.setdefault("ema", {})["decay"] = args.ema_decay
+    if args.lambda_1 is not None:
+        physics_cfg_override = tcfg.setdefault("physics_loss", {})
+        if args.physics_ablation:
+            physics_cfg_override.setdefault("ablation", {})["lambda_1"] = args.lambda_1
+        else:
+            physics_cfg_override["lambda_1"] = args.lambda_1
     check_conditioning_order(tcfg)
     if mcfg.get("sampling", {}).get("schedule", "ddim") != "ddim":
         raise ValueError("baseline sampling.schedule must be 'ddim'")
@@ -235,11 +336,8 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = bool(perf.get("tf32", True))
     mp = tcfg.get("mixed_precision", "bf16")
 
-    dataset = MetamaterialDataset(
-        REPO_ROOT / tcfg["data"]["hdf5"],
-        transform=_make_augment(tcfg["data"].get("augmentation", False),
-                                int(tcfg["seed"])),
-    )
+    augment = bool(tcfg["data"].get("augmentation", False))
+    dataset = MetamaterialDataset(REPO_ROOT / tcfg["data"]["hdf5"])
     min_samples = int(tcfg["data"].get("min_samples", 0))
     if not args.overfit and len(dataset) < min_samples:
         raise RuntimeError(
@@ -288,7 +386,9 @@ def main() -> None:
         sched = None
 
     ema_cfg = tcfg.get("ema", {})
-    ema = EMA(model, float(ema_cfg["decay"])) if ema_cfg.get("enabled", False) else None
+    ema = (EMA(model, float(ema_cfg["decay"]),
+               [float(d) for d in ema_cfg.get("decays", [ema_cfg["decay"]])])
+           if ema_cfg.get("enabled", False) else None)
 
     physics_cfg = tcfg.get("physics_loss", {})
     lamb = _resolve_physics_lambda(physics_cfg, ablation=args.physics_ablation)
@@ -334,9 +434,20 @@ def main() -> None:
         ck = torch.load(args.resume_from, map_location=device, weights_only=True)
         model.load_state_dict(ck["model"])
         if ema:
-            ema_shadow = ck.get("ema")
-            if ema_shadow is not None:
-                ema.shadow = {k: v.detach().clone() for k, v in ema_shadow.items()}
+            live_shadow = {k: v.detach().float().clone() for k, v in ck["model"].items()}
+            ema.shadows = {ema._key(d): {k: v.clone() for k, v in live_shadow.items()}
+                           for d in ema.decays}
+            ema_shadows = ck.get("ema_shadows")
+            if ema_shadows:
+                ema.shadows.update({
+                    key: {k: v.detach().clone() for k, v in shadow.items()}
+                    for key, shadow in ema_shadows.items()
+                })
+                ema.updates = int(ck.get("ema_updates", ck.get("iter", 0)))
+            elif ck.get("ema") is not None:
+                # Resume older single-shadow checkpoints; initialize new decays
+                # from live weights and preserve the legacy primary shadow.
+                ema.shadow = {k: v.detach().clone() for k, v in ck["ema"].items()}
         opt.load_state_dict(ck["optim"])
         if sched is not None and ck.get("scheduler") is not None:
             sched.load_state_dict(ck["scheduler"])
@@ -359,21 +470,23 @@ def main() -> None:
             if global_step >= max_iters:
                 break
             x, c = x.to(device), c.to(device)
+            if augment:
+                x = _augment_batch(x, int(tcfg["seed"]), epoch, batch_idx)
             opt.zero_grad()
             with autocast:
                 # Inline DDPM step so the physics term can be attached to the
                 # denoised x0 prediction (ROADMAP 4.4: proxy sees the soft,
                 # pre-threshold occupancy), not to the noise-free data sample.
-                b = x.shape[0]
-                tt = torch.randint(0, diffusion.T, (b,), device=device)
-                noise = torch.randn_like(x)
-                xt = diffusion.q_sample(x, tt, noise)
-                pred = model(xt, tt, c)
-                loss = F.mse_loss(pred, noise)
+                diffusion_loss, xt, pred, tt, _noise = diffusion.p_losses(
+                    model, x, c, return_aux=True)
+                physics_loss_term = torch.zeros((), device=device)
+                loss = diffusion_loss
                 if lamb > 0.0:
                     lam = lamb * min(1.0, global_step / max(1, warmup_iters))
                     x0 = diffusion.predict_denoised(xt, tt, pred).clamp(0.0, 1.0)
-                    loss = loss + lam * physics(x0, c, tt.to(c.dtype).unsqueeze(-1))
+                    physics_loss_term = lam * physics(
+                        x0, c, tt.to(c.dtype).unsqueeze(-1))
+                    loss = loss + physics_loss_term
             loss.backward()
             grad_norm = _clip_grad(model, grad_clip)
             opt.step()
@@ -390,13 +503,18 @@ def main() -> None:
                          global_step, max_iters, loss.item(), lr, gc_note,
                          time.time() - t_start)
                 log_scalar("train/loss", loss.item(), global_step)
+                log_scalar("train/loss_diffusion", diffusion_loss.item(), global_step)
+                # This is the weighted contribution, so the logged components
+                # sum to train/loss (up to floating-point rounding), including
+                # the configured warm-up and the lambda=0 ablation.
+                log_scalar("train/loss_physics", physics_loss_term.item(), global_step)
                 if grad_norm is not None:
                     log_scalar("train/grad_norm_preclip", grad_norm, global_step)
 
             if global_step % ckpt_every == 0:
                 torch.save({"model": model.state_dict(), "optim": opt.state_dict(),
                             "scheduler": sched.state_dict() if sched else None,
-                            "ema": dict(ema.shadow) if ema else None,
+                            **_ema_checkpoint_fields(ema),
                             "rng": _rng_state(), "iter": global_step}, run_dir / "ckpt.pt")
 
             if global_step % sample_every == 0 or global_step == max_iters:
@@ -410,11 +528,13 @@ def main() -> None:
                             gen = diffusion.sample_ddim(model, cond_test,
                                                         (n_eval, 1, 32, 32, 32),
                                                         steps=steps, eta=float(sampling.get("eta", 0.0)),
+                                                        clamp=tuple(sampling.get("clamp", (-1.0, 1.0))),
                                                         seed=eval_seed)
                     else:
                         gen = diffusion.sample_ddim(model, cond_test,
                                                     (n_eval, 1, 32, 32, 32),
                                                     steps=steps, eta=float(sampling.get("eta", 0.0)),
+                                                    clamp=tuple(sampling.get("clamp", (-1.0, 1.0))),
                                                     seed=eval_seed)
                 img = render_voxel_projection(gen)
                 log_image("eval/samples", img, global_step)
@@ -424,7 +544,7 @@ def main() -> None:
     # final iteration is not aligned with checkpoint_every.
     torch.save({"model": model.state_dict(), "optim": opt.state_dict(),
                 "scheduler": sched.state_dict() if sched else None,
-                "ema": dict(ema.shadow) if ema else None,
+                **_ema_checkpoint_fields(ema),
                 "rng": _rng_state(), "iter": global_step}, run_dir / "ckpt.pt")
 
     LOG.info("training done at iter %d in %.1fs", global_step, time.time() - t_start)
