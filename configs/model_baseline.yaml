@@ -17,5 +17,7 @@ sampling:
   schedule: ddim
   steps: 50                                      # DDIM inference steps; locked 50-100 (Phase 2, Section 4.3)
   eta: 0.0                                       # deterministic DDIM
+  clamp: [0.0, 1.0]                              # binary occupancy x0 range; omit for legacy [-1, 1]
+  batch_size: 32                                 # cap target-chunk GPU memory during inference
   seed: 0                                        # fixed sampling seed; per-target offsets are deterministic
   eval_seed: 0                                   # fixed seed for eval-time DDIM renders inside training

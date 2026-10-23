@@ -13,5 +13,5 @@ The corrected run of the same 50 targets is
 `outputs/acceptance_30k/evaluate_live/`: **92.0% validity**, 0 FEA failures.
 
 Canonical results for the baseline live in `PROJECT.md` §8; the runbook is
-`RuntheBaseline.md`. Kept only as evidence of the fixed defect — cite the
+`RUN-BASE.md`. Kept only as evidence of the fixed defect — cite the
 `acceptance_30k` numbers, never these.

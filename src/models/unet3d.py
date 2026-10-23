@@ -1,8 +1,10 @@
 """3D conditional U-Net (ROADMAP section 4.2).
 
-Config-driven; no hardcoded hyperparameters. Channels [32,64,128,256], three
-down/up stages, bottleneck self-attention at 4^3, FiLM-scale conditioning from
-the normalized [E, rho, nu] vector (order fixed by the manifest). No
+Config-driven; no hardcoded hyperparameters. Four channel stages
+[32,64,128,256] connected by three down/up transitions. Self-attention is used
+at 4^3 resolution in the encoder, bottleneck, and first decoder block.
+FiLM conditioning comes from the normalized [E, rho, nu] vector (order fixed
+by the manifest). No
 cross-attention, no extra conditioning flows (locked decisions).
 """
 from __future__ import annotations

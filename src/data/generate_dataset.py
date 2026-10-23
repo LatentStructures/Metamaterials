@@ -295,7 +295,8 @@ def _build_mesh_and_pairings(res: int) -> tuple:
 def _homogenize_with_retry(family: str, target_rho: float, res: int,
                            homogenizer, mesh, pairings: dict,
                            max_attempts: int, seed: int, index: int,
-                           shape_parameter: float = 1.0
+                           shape_parameter: float = 1.0,
+                           initial_grid: np.ndarray | None = None
                            ) -> tuple[np.ndarray, np.ndarray, float]:
     """Rasterize + homogenize one cell, retrying with a density jitter on failure.
 
@@ -303,8 +304,10 @@ def _homogenize_with_retry(family: str, target_rho: float, res: int,
     actually solved (a jitter retry may have regenerated the geometry). Raises
     ``RuntimeError`` after ``max_attempts``.
     """
-    grid, _ = sample_for_density(family, target_rho, res,
-                                 shape_parameter=shape_parameter)
+    grid = initial_grid
+    if grid is None:
+        grid, _ = sample_for_density(family, target_rho, res,
+                                     shape_parameter=shape_parameter)
     for attempt in range(max_attempts):
         try:
             C6 = homogenizer(grid, mesh, pairings, res)
@@ -326,7 +329,7 @@ def _homogenize_with_retry(family: str, target_rho: float, res: int,
     )
 
 
-def _process_cell(i: int, s: dict) -> dict:
+def _process_cell(i: int, s: dict, initial_grid: np.ndarray | None = None) -> dict:
     """Homogenize one cell inside a worker; retries with jitter on failure.
 
     Returns ``{"C6", "fea_time_s", "voxels"}`` where ``voxels`` is the FINAL
@@ -338,7 +341,7 @@ def _process_cell(i: int, s: dict) -> dict:
         s["family"], float(s["target_density"]), opts["res"],
         opts["homogenizer"], opts["mesh"], opts["pairings"],
         opts["max_attempts"], opts["seed"], i,
-        float(s.get("shape_parameter", 1.0)))
+        float(s.get("shape_parameter", 1.0)), initial_grid)
     return {"C6": C6, "fea_time_s": t, "voxels": grid}
 
 
@@ -436,11 +439,17 @@ def _save_checkpoint(records: list[dict], path: Path) -> None:
     df.to_parquet(path, index=False)
 
 
+def _grid_hash(voxels: np.ndarray) -> bytes:
+    """Stable cache key for a fixed-resolution binary cell."""
+    return hashlib.sha256(np.ascontiguousarray(voxels).tobytes()).digest()
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 
-def _run_parallel(records: list[dict], pending: list[tuple[int, dict]],
+def _run_parallel(records: list[dict],
+                  pending: list[list[tuple[int, dict, np.ndarray]]],
                   n_workers: int, max_attempts: int, seed: int, res: int,
                   base_E: float, base_nu: float, void_scale: float,
                   ckpt_file: Path, checkpoint_every: int, voxdir: Path,
@@ -460,36 +469,41 @@ def _run_parallel(records: list[dict], pending: list[tuple[int, dict]],
     }
     failed = 0
     n_completed = 0
-    LOG.info("running %d cells on %d worker processes (%d already in checkpoint)",
-             len(pending), n_workers, len(records))
+    LOG.info("running %d unique grids (%d cells) on %d worker processes "
+             "(%d already in checkpoint)",
+             len(pending), sum(len(g) for g in pending), n_workers, len(records))
     with ProcessPoolExecutor(
             max_workers=n_workers, initializer=_init_worker, initargs=(opts,),
             mp_context=multiprocessing.get_context("spawn")) as ex:
-        futures = {ex.submit(_process_cell, i, s): (i, s) for i, s in pending}
+        futures = {ex.submit(_process_cell, members[0][0], members[0][1],
+                             members[0][2]): members for members in pending}
         for fut in as_completed(futures):
-            i, s = futures[fut]
+            members = futures[fut]
             try:
                 out = fut.result()
             except Exception:
-                failed += 1
-                LOG.exception("sample %d (%s) failed", i, s["family"])
+                failed += len(members)
+                LOG.exception("duplicate group represented by sample %d (%s) failed",
+                              members[0][0], members[0][1]["family"])
                 continue
-            s["voxels"] = out["voxels"]  # final grid (may be a jitter retry)
-            try:
-                rec = _assemble_record(i, s, out["C6"], out["fea_time_s"],
-                                       voxdir, out["voxels"])
-            except ValueError as exc:
-                failed += 1
-                LOG.error("sample %d (%s) produced an unphysical stiffness (%s); skipping",
-                          i, s["family"], exc)
-                continue
-            records.append(rec)
-            n_completed += 1
-            if n_completed % checkpoint_every == 0:
+            for i, s, _grid in members:
+                s["voxels"] = out["voxels"]
+                try:
+                    rec = _assemble_record(i, s, out["C6"], out["fea_time_s"],
+                                           voxdir, out["voxels"])
+                except ValueError as exc:
+                    failed += 1
+                    LOG.error("sample %d (%s) produced an unphysical stiffness (%s); skipping",
+                              i, s["family"], exc)
+                    continue
+                records.append(rec)
+                n_completed += 1
+            if n_completed >= checkpoint_every:
                 _save_checkpoint(records, ckpt_file)
                 LOG.info("checkpoint %d/%d (%.1f%%) at %.1fs",
                          len(records), total,
                          100 * len(records) / total, time.time() - t0)
+                n_completed = 0
 
     _save_checkpoint(records, ckpt_file)
     return records, failed
@@ -548,36 +562,72 @@ def generate(config_path: str | Path, mock_fea: bool = False,
     failed = 0
     t0 = time.time()
 
-    pending = [(i, s) for i, s in enumerate(samples) if i not in done]
-    if not pending:
+    pending_cells = [(i, s) for i, s in enumerate(samples) if i not in done]
+    # Rasterize once in the parent, then solve each distinct voxel grid once.
+    # Existing checkpoint rows seed the hash->C6 cache, so resume runs also
+    # reuse completed labels when a pending design quantizes to a prior grid.
+    cache: dict[bytes, tuple[np.ndarray, np.ndarray, float]] = {}
+    for r in records:
+        if r.get("C6") is not None:
+            cache.setdefault(_grid_hash(r["voxels"]),
+                             (r["C6"], r["voxels"], float(r.get("fea_time_s", 0.0))))
+    grouped: dict[bytes, list[tuple[int, dict, np.ndarray]]] = {}
+    cache_hits = 0
+    for i, s in pending_cells:
+        grid, _ = sample_for_density(
+            s["family"], float(s["target_density"]), res,
+            shape_parameter=float(s.get("shape_parameter", 1.0)))
+        key = _grid_hash(grid)
+        if key in cache:
+            C6, cached_grid, _cached_time = cache[key]
+            rec = _assemble_record(i, s, C6, 0.0, voxdir, cached_grid)
+            records.append(rec)
+            cache_hits += 1
+        else:
+            grouped.setdefault(key, []).append((i, s, grid))
+    pending_groups = list(grouped.values())
+    if cache_hits:
+        LOG.info("reused %d cached stiffness tensors; %d unique grids remain",
+                 cache_hits, len(pending_groups))
+    if not pending_groups:
         LOG.info("all %d samples already in checkpoint; skipping FEA", total)
     elif n_workers is not None and n_workers > 1 and not mock_fea:
         records, failed = _run_parallel(
-            records, pending, n_workers, max_attempts, seed, res, base_E, base_nu,
+            records, pending_groups, n_workers, max_attempts, seed, res, base_E, base_nu,
             void_scale, ckpt_file, checkpoint_every, voxdir, total, t0)
     else:
         if mock_fea and (n_workers or 1) > 1:
             LOG.warning("n_workers>1 ignored for --mock-fea (serial); "
                         "multiprocessing only applies to the real FEA path")
         mesh, pairings = _build_mesh_and_pairings(res)
-        for i, s in pending:
+        for members in pending_groups:
+            i, s, grid = members[0]
             try:
                 C6, grid, fea_time = _homogenize_with_retry(
                     s["family"], float(s["target_density"]), res, homogenizer,
                     mesh, pairings, max_attempts, seed, i,
-                    float(s.get("shape_parameter", 1.0)))
-                rec = _assemble_record(i, s, C6, fea_time, voxdir, grid)
+                    float(s.get("shape_parameter", 1.0)), grid)
             except (RuntimeError, ValueError) as exc:
-                failed += 1
-                LOG.error("sample %d (%s) failed and was skipped: %s",
+                failed += len(members)
+                LOG.error("duplicate group represented by sample %d (%s) failed: %s",
                           i, s["family"], exc)
                 continue
-            records.append(rec)
+            for i, s, _initial_grid in members:
+                s["voxels"] = grid
+                try:
+                    rec = _assemble_record(i, s, C6, fea_time, voxdir, grid)
+                except ValueError as exc:
+                    failed += 1
+                    LOG.error("sample %d (%s) produced an unphysical stiffness (%s); skipping",
+                              i, s["family"], exc)
+                    continue
+                records.append(rec)
 
-            if (i + 1) % checkpoint_every == 0:
+            if len(records) % checkpoint_every < len(members):
                 _save_checkpoint(records, ckpt_file)
                 elapsed = time.time() - t0
-                LOG.info("checkpoint %d/%d (%.1f%%) at %.1fs", i + 1, total, 100 * (i + 1) / total, elapsed)
+                LOG.info("checkpoint %d/%d (%.1f%%) at %.1fs", len(records), total,
+                         100 * len(records) / total, elapsed)
 
     _save_checkpoint(records, ckpt_file)
     LOG.info("FEA complete: %d records (%d failed/skipped); "
@@ -678,8 +728,8 @@ def generate(config_path: str | Path, mock_fea: bool = False,
             "E_eff": float(r.get("E_eff", r["cond"][CONDITIONING_ORDER.index("E")])),
             "nu_eff": float(r.get("nu_eff", r["cond"][CONDITIONING_ORDER.index("nu")])),
             "fea_time_s": float(r.get("fea_time_s", np.nan)),
-            "voxel_path": str(voxdir / Path(r.get("voxel_path", "")))
-                           if r.get("voxel_path") else "",
+            "voxel_path": str((voxdir / Path(r.get("voxel_path", "")))
+                              .relative_to(REPO_ROOT)) if r.get("voxel_path") else "",
             "hdf5_path": config["hdf5"].format(split=split_name),
         })
     manifest = pd.DataFrame(manifest_rows)

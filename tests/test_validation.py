@@ -148,3 +148,10 @@ def test_evaluate_validity_on_solid():
 def test_evaluate_validity_reports_reason():
     ok, reason = v.evaluate_validity(np.zeros((8, 8, 8), dtype=np.uint8), {})
     assert not ok and reason == "connectivity"
+
+
+def test_diagonal_contact_across_periodic_face_is_connected():
+    vol = np.zeros((32, 32, 32), dtype=np.uint8)
+    vol[31, 5, 5] = 1
+    vol[0, 6, 5] = 1
+    assert v.compute_components(vol) == 1

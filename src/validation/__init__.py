@@ -15,7 +15,10 @@ they are in fact one connected phase that touches all six faces.
 
 The 3x3x3 adjacency convention here matches the Option-B physics proxy in
 ``src/losses/physics_loss.py``, so the soft training signal and this hard filter
-agree on corner-touching structures.
+agree on corner-touching structures. This is a voxel-topology convention: an
+edge- or corner-only contact does not provide a finite cross-section and is not
+evidence of a robust load path. Passing this check is not a mechanical-strength
+or manufacturability guarantee; wall checks and FEA are separate gates.
 
 Optional override: define ``filter_generated(vol: np.ndarray) -> bool`` in this
 module to replace the built-in heuristic during evaluation; ``src.evaluate``
@@ -23,6 +26,7 @@ uses it when present.
 """
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 
 import numpy as np
@@ -60,26 +64,27 @@ def _count_periodic_components(vol: np.ndarray) -> int:
     solid = np.asarray(vol, dtype=bool)
     if not solid.any():
         return 0
-    lab, n = ndimage.label(solid, structure=_AXIS_STRUCTURE)
-
-    parent = list(range(n + 1))
+    labels, n = ndimage.label(solid, structure=_AXIS_STRUCTURE)
+    parent = np.arange(n + 1)
 
     def find(x: int) -> int:
         while parent[x] != x:
             parent[x] = parent[parent[x]]
-            x = parent[x]
+            x = int(parent[x])
         return x
 
-    for axis in range(3):
-        shifted = np.roll(lab, 1, axis=axis)  # neighbour reached by wrapping
-        overlap = solid & (shifted > 0)
-        if not overlap.any():
+    for offset in itertools.product((-1, 0, 1), repeat=3):
+        if offset == (0, 0, 0):
             continue
-        for a, b in zip(lab[overlap].ravel(), shifted[overlap].ravel(), strict=True):
+        shifted = np.roll(labels, offset, axis=(0, 1, 2))
+        pairs = np.stack((labels[solid & (shifted > 0)],
+                          shifted[solid & (shifted > 0)]), axis=1)
+        if not pairs.size:
+            continue
+        for a, b in np.unique(pairs, axis=0):
             ra, rb = find(int(a)), find(int(b))
             if ra != rb:
                 parent[ra] = rb
-
     return len({find(i) for i in range(1, n + 1)})
 
 def compute_components(vol: np.ndarray) -> int:
@@ -88,8 +93,10 @@ def compute_components(vol: np.ndarray) -> int:
     The 3x3x3 structuring element matches the adjacency convention used by the
     Option-B physics proxy (``src/losses/physics_loss.py``), so the soft
     connectivity signal and the hard validity filter agree on corner-touching
-    structures. Components that meet across a wrapped face are merged, because
-    the cell is tessellated rather than a closed standalone body.
+    structures. This is a discrete topological convention; it does not certify
+    finite contact area or load-bearing robustness. Components that meet across
+    a wrapped face are merged, because the cell is tessellated rather than a
+    closed standalone body.
     """
     solid = np.asarray(vol, dtype=bool)
     if not solid.any():

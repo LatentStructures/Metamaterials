@@ -87,7 +87,9 @@ def reconstruction_metrics(pred: np.ndarray, target: np.ndarray,
             "p95_abs_rel_err": float(np.percentile(rel[:, k], 95)),
             "mae": float(np.mean(np.abs(pred[:, k] - target[:, k]))),
             "rmse": float(np.sqrt(np.mean((pred[:, k] - target[:, k]) ** 2))),
-            "r2": float(r2),
+            # R² is undefined when the target has no variance (including a
+            # one-sample smoke evaluation). Use JSON null rather than NaN.
+            "r2": float(r2) if np.isfinite(r2) else None,
             "bias": float(np.mean(pred[:, k] - target[:, k])),
         }
     return out
@@ -171,18 +173,32 @@ def run_evaluate(cfg: dict, samples_dir: Path, out_dir: Path,
                       fname, voxels.shape, res_expected, res_expected, res_expected)
         jobs.append((idx, row, voxels, res_ok))
 
+    pluggable = None if no_filter else _plugged_filter()
+    validity: dict[int, tuple[bool, str]] = {}
+    for idx, _row, voxels, res_ok in jobs:
+        if not res_ok:
+            validity[idx] = (False, "resolution_mismatch")
+        elif no_filter:
+            validity[idx] = (True, "ok")
+        elif pluggable is not None:
+            passed = bool(pluggable(voxels))
+            validity[idx] = (passed, "plugged" if passed else "plugged_filter")
+        else:
+            validity[idx] = evaluate_validity(voxels, cfg)
+
     c6s: dict[int, np.ndarray] = {}
     if fea_fn is not None:
         # Injected stub (tests): evaluate in-process, exactly as before.
         for idx, _row, voxels, res_ok in jobs:
-            if not res_ok:
+            if not res_ok or not validity[idx][0]:
                 continue
             try:
                 c6s[idx] = fea_fn(voxels, voxels.shape[0])
             except Exception:
                 LOG.exception("FEA failed for %s; excluded from metrics", _row["file"])
     else:
-        fea_jobs = [(idx, voxels) for idx, _r, voxels, ok in jobs if ok]
+        fea_jobs = [(idx, voxels) for idx, _r, voxels, ok in jobs
+                    if ok and validity[idx][0]]
         n_workers = max(1, min(int(cfg.get("n_workers", os.cpu_count() or 1)),
                                os.cpu_count() or 1))
         omp_threads = max(1, (os.cpu_count() or 1) // n_workers)
@@ -203,13 +219,15 @@ def run_evaluate(cfg: dict, samples_dir: Path, out_dir: Path,
                     except Exception:
                         LOG.exception("FEA failed for sample %d; excluded from metrics", idx)
 
-    pluggable = None if no_filter else _plugged_filter()
-
     rows = []
     fea_fail = 0
     for idx, row, voxels, res_ok in jobs:
         achieved_rho = float(voxels.mean())
-        if res_ok and idx in c6s:
+        valid, valid_reason = validity[idx]
+        if not valid:
+            E_eff = nu_eff = float("nan")
+            reason = valid_reason
+        elif res_ok and idx in c6s:
             try:
                 ep = effective_properties(c6s[idx])
                 E_eff, nu_eff = float(ep.E), float(ep.nu)
@@ -218,7 +236,7 @@ def run_evaluate(cfg: dict, samples_dir: Path, out_dir: Path,
                 fea_fail += 1
                 E_eff = nu_eff = float("nan")
                 reason = "fea_failed"
-        elif res_ok:
+        elif valid and res_ok:
             fea_fail += 1
             E_eff = nu_eff = float("nan")
             reason = "fea_failed"
@@ -226,14 +244,7 @@ def run_evaluate(cfg: dict, samples_dir: Path, out_dir: Path,
             E_eff = nu_eff = float("nan")
             reason = "resolution_mismatch"
 
-        valid = reason == "ok"
-        valid_reason = reason
-        if valid and not no_filter:
-            if pluggable is not None:
-                valid = bool(pluggable(voxels))
-                valid_reason = "plugged" if valid else "plugged_filter"
-            else:
-                valid, valid_reason = evaluate_validity(voxels, cfg)
+        valid = valid and reason == "ok"
 
         rows.append({
             "file": row["file"],
@@ -244,7 +255,7 @@ def run_evaluate(cfg: dict, samples_dir: Path, out_dir: Path,
             "E_eff": E_eff,
             "nu_eff": nu_eff,
             "valid": valid,
-            "reason": valid_reason,
+            "reason": reason if valid else (valid_reason if reason != "fea_failed" else reason),
         })
 
     df = pd.DataFrame(rows, columns=[
@@ -272,7 +283,7 @@ def run_evaluate(cfg: dict, samples_dir: Path, out_dir: Path,
         report["reconstruction"] = {}
 
     with (out_dir / "report.json").open("w", encoding="utf-8") as fh:
-        json.dump(report, fh, indent=2, default=float)
+        json.dump(report, fh, indent=2, default=float, allow_nan=False)
 
     if len(valid_df):
         _write_plots(valid_df, out_dir)
@@ -283,6 +294,7 @@ def run_evaluate(cfg: dict, samples_dir: Path, out_dir: Path,
 
 
 def _write_plots(df: pd.DataFrame, out_dir: Path) -> None:
+    """Write parity plots and rel-error histograms (values above 1 are capped)."""
     import matplotlib
 
     matplotlib.use("Agg")

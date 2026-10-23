@@ -6,6 +6,9 @@ reprocessed already-completed cells and never retried the failed ones.
 """
 from __future__ import annotations
 
+import itertools
+from pathlib import Path
+
 import h5py
 import numpy as np
 import pandas as pd
@@ -152,14 +155,30 @@ def test_generate_resume_skips_done_and_retries_failed(monkeypatch, tmp_path):
 
     ckpt = tmp_path / "data" / "checkpoints" / "ckpt_tiny_s0.parquet"
     assert ckpt.exists()
-    assert len(pd.read_parquet(ckpt)) == 3, "two injected failures must be absent"
+    first_checkpoint = pd.read_parquet(ckpt)
+    assert 0 < len(first_checkpoint) < 5, "injected failures must be absent"
+    done_hashes = set()
+    for rel_path in first_checkpoint["voxel_path"]:
+        vox = np.load(tmp_path / "data" / "checkpoints" / "vox" / rel_path)
+        done_hashes.add(gen._grid_hash(vox))
+    cfg = gen.load_yaml(cfg_path)
+    all_samples = gen._sample_all(cfg, np.random.default_rng(cfg["seed"]))
+    all_hashes = {
+        gen._grid_hash(gen.sample_for_density(
+            s["family"], s["target_density"], cfg["resolution"],
+            shape_parameter=s.get("shape_parameter", 1.0))[0])
+        for s in all_samples
+    }
+    expected_retry_solves = len(all_hashes - done_hashes)
 
     run2 = _FailGuard(gen._MockHomogenizer(), fail_first=0)
     monkeypatch.setattr(gen, "_load_homogenizer",
                         lambda *a, **k: (run2, None))
     gen.generate(cfg_path, mock_fea=True)
 
-    assert run2.calls == 2, "resume must redo only the two failed cells"
+    assert run2.calls == expected_retry_solves, (
+        "resume must solve only distinct grids absent from the checkpoint"
+    )
 
     manifest = pd.read_parquet(tmp_path / "manifest.parquet")
     assert len(manifest) == 5
@@ -167,9 +186,11 @@ def test_generate_resume_skips_done_and_retries_failed(monkeypatch, tmp_path):
     assert set(manifest["cell_id"]) == {0, 1, 2, 3, 4}
 
     # ROADMAP 3.4: HDF5 carries /metadata plus the locked conditioning order,
-    # and the manifest carries the achieved E/nu plus an absolute voxel path.
+    # and the manifest carries achieved E/nu plus a repository-relative voxel path.
     assert {"E_eff", "nu_eff", "voxel_path"}.issubset(manifest.columns)
-    assert str(manifest.iloc[0]["voxel_path"]).startswith(str(tmp_path))
+    voxel_path = Path(manifest.iloc[0]["voxel_path"])
+    assert not voxel_path.is_absolute()
+    assert (tmp_path / voxel_path).is_file()
     with h5py.File(tmp_path / "dataset_train.h5", "r") as f:
         assert "/metadata" in f and "/conditioning_order" in f
         meta = f["/metadata"]
@@ -178,6 +199,80 @@ def test_generate_resume_skips_done_and_retries_failed(monkeypatch, tmp_path):
             assert col in meta.dtype.names, meta.dtype.names
         order = [str(s, "utf-8") for s in f["/conditioning_order"][...]]
         assert order == ["E", "relative_density", "nu"]
+
+
+def test_generate_solves_duplicate_grid_once(monkeypatch, tmp_path):
+    cfg_path = _write_tiny_config(tmp_path)
+    monkeypatch.setattr(gen, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(gen, "_sample_all", lambda *_args: [
+        {"family": "cubic_strut", "target_density": 0.3} for _ in range(5)
+    ])
+    solver = _FailGuard(gen._MockHomogenizer())
+    monkeypatch.setattr(gen, "_load_homogenizer", lambda *a, **k: (solver, None))
+
+    gen.generate(cfg_path, mock_fea=True)
+
+    assert solver.calls == 1
+    checkpoint = pd.read_parquet(
+        tmp_path / "data" / "checkpoints" / "ckpt_tiny_s0.parquet")
+    assert len(checkpoint) == 5
+    c6_columns = [f"C6_{i}" for i in range(36)]
+    assert np.allclose(checkpoint[c6_columns].to_numpy(),
+                       checkpoint[c6_columns].iloc[0].to_numpy())
+
+
+def test_cached_generation_matches_uncached_reference(monkeypatch, tmp_path):
+    """The duplicate-grid cache must not change any generated label.
+
+    ``test_generate_solves_duplicate_grid_once`` proves that identical grids
+    trigger a single solve; it does not prove that reusing a cached stiffness
+    tensor yields the same output as solving every cell. This runs the same
+    five-cell generation twice -- once with the cache active, once with the
+    cache key disabled so every cell is solved -- and compares row counts,
+    stiffness tensors, and conditioning labels.
+    """
+    specs = [{"family": "cubic_strut", "target_density": 0.3} for _ in range(5)]
+
+    def run(root: Path, disable_cache: bool) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+        root.mkdir(parents=True, exist_ok=True)
+        cfg_path = _write_tiny_config(root)
+        monkeypatch.setattr(gen, "REPO_ROOT", root)
+        monkeypatch.setattr(gen, "_sample_all", lambda *_args: list(specs))
+        solver = _FailGuard(gen._MockHomogenizer())
+        monkeypatch.setattr(gen, "_load_homogenizer", lambda *a, **k: (solver, None))
+        if disable_cache:
+            counter = itertools.count()
+            monkeypatch.setattr(
+                gen, "_grid_hash",
+                lambda _voxels: next(counter).to_bytes(8, "little"))
+        gen.generate(cfg_path, mock_fea=True)
+        checkpoint = pd.read_parquet(
+            root / "data" / "checkpoints" / "ckpt_tiny_s0.parquet")
+        manifest = pd.read_parquet(root / "manifest.parquet")
+        return checkpoint, manifest, solver.calls
+
+    cached_ckpt, cached_manifest, cached_calls = run(tmp_path / "cached", False)
+    ref_ckpt, ref_manifest, ref_calls = run(tmp_path / "reference", True)
+
+    # the cache must actually have been exercised in both directions
+    assert cached_calls == 1, cached_calls
+    assert ref_calls == 5, ref_calls
+
+    assert len(cached_ckpt) == len(ref_ckpt) == 5
+    c6_columns = [f"C6_{i}" for i in range(36)]
+    assert np.allclose(cached_ckpt[c6_columns].to_numpy(),
+                       ref_ckpt[c6_columns].to_numpy())
+    label_columns = [c for c in cached_ckpt.columns
+                     if c.startswith("cond_") or c == "achieved_density"]
+    assert label_columns, cached_ckpt.columns.tolist()
+    for column in label_columns:
+        assert np.allclose(cached_ckpt[column].to_numpy(), ref_ckpt[column].to_numpy())
+
+    assert len(cached_manifest) == len(ref_manifest) == 5
+    for column in ("family", "split", "achieved_density", "target_density",
+                   "E_eff", "nu_eff"):
+        assert column in cached_manifest.columns, cached_manifest.columns.tolist()
+        assert (cached_manifest[column].to_numpy() == ref_manifest[column].to_numpy()).all()
 
 
 def test_check_cross_split_leakage():

@@ -2,7 +2,11 @@
 import numpy as np
 import torch
 
-from src.losses.physics_loss import connectivity_proxy_loss
+from src.losses.physics_loss import (
+    _periodic_neighbor_sum,
+    _reference_fiedler,
+    connectivity_proxy_loss,
+)
 
 
 def _grid(solid_slices: list[tuple[slice, slice, slice]], n: int = 32) -> torch.Tensor:
@@ -44,6 +48,8 @@ def test_empty_grid_deficit_is_one():
 
 
 def test_differentiable_in_p():
+    _reference_fiedler((32, 32, 32))  # isolate the test from cache warm-up RNG use
+    torch.manual_seed(3)
     x = _soft_bridged_blocks().requires_grad_(True)
     d = connectivity_proxy_loss(x)
     d.backward()
@@ -63,3 +69,25 @@ def test_epsilon_parameter_respected():
     d_few = connectivity_proxy_loss(_two_isolated_blocks(), iterations=5)
     d_many = connectivity_proxy_loss(_two_isolated_blocks(), iterations=50)
     assert d_many.item() > d_few.item()  # tighter convergence -> closer to 1
+
+
+def test_avg_pool_neighbour_sum_matches_conv_and_gradients():
+    import torch.nn.functional as F
+
+    x1 = torch.rand(2, 1, 7, 7, 7, requires_grad=True)
+    x2 = x1.detach().clone().requires_grad_(True)
+    kernel = torch.ones(1, 1, 3, 3, 3)
+    old = F.conv3d(F.pad(x1, (1, 1, 1, 1, 1, 1), mode="circular"), kernel)
+    new = _periodic_neighbor_sum(x2)
+    torch.testing.assert_close(new, old, atol=1e-6, rtol=1e-6)
+    old.square().sum().backward()
+    new.square().sum().backward()
+    torch.testing.assert_close(x2.grad, x1.grad, atol=1e-5, rtol=1e-6)
+
+
+def test_periodic_neighbor_sum_wraps_edge_voxels():
+    x = torch.zeros(1, 1, 4, 4, 4)
+    x[0, 0, 0, 1, 1] = 1.0
+    sums = _periodic_neighbor_sum(x)
+    assert sums[0, 0, -1, 1, 1] == 1.0
+    assert sums[0, 0, 0, 1, 1] == 1.0  # self included in stencil sum
