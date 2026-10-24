@@ -13,7 +13,8 @@ training, ``x`` is the model's predicted ``x0``).  A binary connected-component
 count is not differentiable, so ``L_physics`` is a *normalized* soft
 algebraic-connectivity deficit of the weighted 26-neighbourhood graph::
 
-    A_ij = p_i p_j,   D_ii = sum_j A_ij,   L = I - D^{-1/2} A D^{-1/2}
+    A_ij = p_i p_j for periodic 26-neighbours,
+    D_ii = sum_j A_ij,   L = I - D^{-1/2} A D^{-1/2}
     lambda_2_hat = 1 - Rayleigh(M)        (deflated power iteration on
                                           M = D^{-1/2} A D^{-1/2} = I - L)
     L_physics = (1 - min(lambda_2_hat / lambda_ref, 1))^2
@@ -40,6 +41,13 @@ __all__ = ["connectivity_proxy_loss"]
 _REFERENCE_ITERATIONS = 200
 
 
+def _periodic_neighbor_sum(x: torch.Tensor) -> torch.Tensor:
+    """Sum each voxel and its 26 neighbours with periodic cell boundaries."""
+    wrapped = nn.functional.pad(x, (1, 1, 1, 1, 1, 1), mode="circular")
+    return 27.0 * nn.functional.avg_pool3d(
+        wrapped, kernel_size=3, stride=1, padding=0, count_include_pad=True)
+
+
 def _unit_norm(x: torch.Tensor) -> torch.Tensor:
     """Normalize a (B, 1, D, H, W) tensor to unit L2 norm per sample."""
     return x / x.reshape(x.shape[0], -1).norm(dim=1).view(
@@ -62,28 +70,23 @@ def _fiedler_estimate(p: torch.Tensor, iterations: int = 60) -> torch.Tensor:
     to ``lambda_2(L) = 0`` quickly.  Empty samples return 0.
     """
     B = p.shape[0]
-    s = nn.functional.conv3d(p, torch.ones(1, 1, 3, 3, 3, device=p.device, dtype=p.dtype),
-                             padding=1)
+    s = _periodic_neighbor_sum(p)
     D = (p * s - p * p).clamp(min=0.0)
 
     dsum = D.reshape(B, -1).sum(dim=1)
     good = dsum > 1e-12
-    if not bool(good.any()):
-        return torch.zeros(B, device=p.device, dtype=p.dtype)
-
     mask = good.to(p.dtype).view(B, 1, 1, 1, 1)
     Dg = D * mask
     dinv = (Dg + 1e-8).rsqrt()
     u = Dg * dinv
     u = u / (u.reshape(B, -1).norm(dim=1).view(B, 1, 1, 1, 1) + 1e-8)
 
-    ones = torch.ones(1, 1, 3, 3, 3, device=p.device, dtype=p.dtype)
-
     def mv(s):
         """M s = D^{-1/2} A D^{-1/2} s for the weighted 26-neighbour adjacency."""
         w = dinv * s
         pw = p * w
-        aw = p * (nn.functional.conv3d(pw, ones, padding=1) - pw)
+        neighbour_sum = _periodic_neighbor_sum(pw)
+        aw = p * (neighbour_sum - pw)
         return dinv * aw
 
     v = torch.randn_like(p)
@@ -123,8 +126,10 @@ def connectivity_proxy_loss(
     ``cond`` and ``t`` are accepted for compatibility with the training-loop
     call signature but do not influence Option B (the baseline proxy is
     unconditional -- it sees neither the conditioning targets nor the timestep).
-    It was designed to protect the validity rate; the lambda_1 = 0 ablation
-    measured no benefit on any metric (see ``README.md``).
+    It was designed to protect the validity rate. The historical lambda_1 = 0
+    ablation measured the legacy zero-padded graph and cannot establish benefit
+    or harm for this corrected periodic implementation (see ``README.md`` and
+    ``PROJECT.md`` §8).
 
     ``iterations`` bounds the power iteration that runs inside the autograd
     graph. The default of 60 is the train-config value

@@ -81,9 +81,10 @@ def _parse():
     ap.add_argument("--n-per-target", type=int, default=1)
     ap.add_argument("--seed", type=int, default=None,
                     help="override the sampling seed (default: model config sampling.seed)")
-    ap.add_argument("--weights", choices=("ema", "live"), default="live",
+    ap.add_argument("--weights", choices=("ema", "ema-0.999", "ema-0.9995",
+                                           "ema-0.9999", "live"), default="live",
                     help="checkpoint weights to sample with. Default 'live': at the "
-                         "baseline's decay=0.9999 over a 30k cosine-annealed run the "
+                         "historical single decay=0.9999 run over a 30k cosine schedule the "
                          "EMA shadow lags into a less-converged region and generates "
                          "fragmented grids (14%% valid vs 92%% live); see PROJECT.md §8")
     ap.add_argument("--export-stl", action="store_true")
@@ -107,14 +108,22 @@ def main() -> None:
 
     model = UNet3D.from_config(mcfg["unet3d"]).to(device)
     ck = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    # Default is 'live' (see --weights): with decay=0.9999 the EMA shadow spans
-    # ~10k steps centred ~step 25k, i.e. before the cosine LR reaches 0, so it
-    # samples a less-converged model and returns fragmented (invalid) grids.
-    # 'ema' stays available for the documented A/B.
+    # Default is 'live' (see --weights): the historical single-decay 0.9999
+    # shadow spans ~10k steps centred near step 25k, before the cosine LR reaches
+    # 0, and returned fragmented grids. The multi-decay shadows can be selected
+    # explicitly with --weights ema-0.999, ema-0.9995, or ema-0.9999.
     if args.weights == "ema":
         if not ck.get("ema"):
             raise SystemExit(f"--weights ema requested but {args.checkpoint} has no 'ema' entry")
         state = ck["ema"]
+    elif args.weights.startswith("ema-"):
+        decay_key = args.weights.removeprefix("ema-")
+        shadows = ck.get("ema_shadows") or {}
+        if decay_key not in shadows:
+            raise SystemExit(
+                f"--weights {args.weights} requested but checkpoint lacks that EMA shadow"
+            )
+        state = shadows[decay_key]
     else:
         state = ck["model"]
     model.load_state_dict(state)
@@ -139,31 +148,45 @@ def main() -> None:
     grid_rows = []
     model.eval()
     with torch.no_grad():
-        for ti, c in enumerate(conds):
-            c_b = torch.as_tensor(c[None], dtype=torch.float32, device=device).repeat(args.n_per_target, 1)
-            # One seed per target (base_seed + ti * n); the N draws differ
-            # because sample_ddim draws N independent noise rows for that seed,
-            # so --n-per-target N returns distinct samples with real spread for
-            # the validity rate, and no two targets ever share a noise batch.
-            gen = diffusion.sample_ddim(model, c_b, (args.n_per_target, 1, 32, 32, 32),
-                                        steps=steps,
-                                        eta=float(sampling_cfg.get("eta", 0.0)),
-                                        seed=base_seed + ti * args.n_per_target)
-            for si in range(args.n_per_target):
-                v = (gen[si, 0].cpu().numpy() > 0.5).astype(np.uint8)
-                name = f"sample_t{ti:02d}_s{si:02d}"
-                np.save(out_dir / f"{name}.npy", v)
-                if args.export_stl:
-                    surf = voxels_to_surface(v)
-                    surf.write(str(out_dir / f"{name}.stl"))
-                    LOG.info("wrote %s.stl", name)
-                grid_rows.append({
-                    "file": f"{name}.npy",
-                    "target_E": float(targets.iloc[ti]["E"]),
-                    "target_rho": float(targets.iloc[ti]["relative_density"]),
-                    "target_nu": float(targets.iloc[ti]["nu"]),
-                    "achieved_rho": float(v.mean()),
-                })
+        n_targets = len(conds)
+        max_batch = max(1, int(sampling_cfg.get("batch_size", 32)))
+        targets_per_batch = max(1, max_batch // args.n_per_target)
+        for target_start in range(0, n_targets, targets_per_batch):
+            target_stop = min(n_targets, target_start + targets_per_batch)
+            target_indices = range(target_start, target_stop)
+            c_b = torch.as_tensor(conds[target_start:target_stop], dtype=torch.float32,
+                                  device=device).repeat_interleave(args.n_per_target, dim=0)
+            # Preserve each target's legacy initial-noise block exactly; chunking
+            # bounds GPU memory without changing the seed assigned to any draw.
+            noise_blocks = []
+            for ti in target_indices:
+                gen = torch.Generator(device=device).manual_seed(
+                    base_seed + ti * args.n_per_target)
+                noise_blocks.append(torch.randn(
+                    (args.n_per_target, 1, 32, 32, 32), device=device, generator=gen))
+            x_init = torch.cat(noise_blocks, dim=0)
+            generated = diffusion.sample_ddim(
+                model, c_b, tuple(x_init.shape), steps=steps,
+                eta=float(sampling_cfg.get("eta", 0.0)),
+                clamp=tuple(sampling_cfg.get("clamp", (-1.0, 1.0))),
+                x_init=x_init)
+            for local_ti, ti in enumerate(target_indices):
+                for si in range(args.n_per_target):
+                    flat_idx = local_ti * args.n_per_target + si
+                    v = (generated[flat_idx, 0].cpu().numpy() > 0.5).astype(np.uint8)
+                    name = f"sample_t{ti:02d}_s{si:02d}"
+                    np.save(out_dir / f"{name}.npy", v)
+                    if args.export_stl:
+                        surf = voxels_to_surface(v)
+                        surf.write(str(out_dir / f"{name}.stl"))
+                        LOG.info("wrote %s.stl", name)
+                    grid_rows.append({
+                        "file": f"{name}.npy",
+                        "target_E": float(targets.iloc[ti]["E"]),
+                        "target_rho": float(targets.iloc[ti]["relative_density"]),
+                        "target_nu": float(targets.iloc[ti]["nu"]),
+                        "achieved_rho": float(v.mean()),
+                    })
     pd.DataFrame(grid_rows).to_csv(out_dir / "samples_manifest.csv", index=False)
     LOG.info("wrote %d samples to %s", len(grid_rows), out_dir)
 

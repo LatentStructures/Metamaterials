@@ -3,6 +3,8 @@
 The FEA solver caches per-resolution problem data and carries module-level
 material state, so every test pins ``set_base_material`` explicitly.
 """
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -173,3 +175,35 @@ def test_homogenizer_wrapper_times():
     C6 = h(grid, mesh, None, RES)
     assert C6.shape == (6, 6)
     assert len(h.times) == 1 and h.times[0] > 0
+
+
+def test_dataset_golden_cells_reproduce_stored_stiffness():
+    """Pin solver agreement to stored cells at low/high density per family.
+
+    The compact fixture contains four distinct valid cells per family selected
+    from the training HDF5: two from each end of its achieved-density range.
+    A 1e-4 scale-relative tolerance is loose relative to the observed replay
+    error (~1e-8) while protecting against silent solver or mesh drift.
+    """
+    fixture = Path(__file__).parent / "fixtures" / "homogenization_golden.npz"
+    with np.load(fixture, allow_pickle=False) as data:
+        voxels = data["voxels"]
+        references = data["stiffness_tensor"]
+        families = data["family"]
+        density = data["achieved_density"]
+
+    assert voxels.shape == (12, 32, 32, 32)
+    assert references.shape == (12, 6, 6)
+    assert set(families.tolist()) == {"cubic_strut", "gyroid", "octet_truss"}
+    for family in ("cubic_strut", "gyroid", "octet_truss"):
+        family_rows = np.flatnonzero(families == family)
+        assert family_rows.size == 4
+        family_density = density[family_rows]
+        assert family_density[:2].max() < family_density[2:].min()
+
+    for grid, reference in zip(voxels, references, strict=True):
+        mesh = voxels_to_tetra(grid)
+        computed = homogenize_periodic_cell(grid, mesh, None, 32)
+        scale = max(float(np.abs(reference).max()), np.finfo(float).tiny)
+        relative_error = float(np.abs(computed - reference).max() / scale)
+        assert relative_error <= 1e-4, relative_error

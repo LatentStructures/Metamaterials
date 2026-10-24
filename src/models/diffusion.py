@@ -59,25 +59,34 @@ class GaussianDiffusion:
         return x0
 
     def p_losses(self, model: nn.Module, x0: torch.Tensor, cond: torch.Tensor,
-                 rng: torch.Generator | None = None) -> torch.Tensor:
-        """Random timestep eps-MSE (L_simple) -- the only training loss."""
+                 rng: torch.Generator | None = None,
+                 return_aux: bool = False) -> torch.Tensor | tuple[
+                     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Random timestep eps-MSE; optionally return (xt, eps, t, noise)."""
         b = x0.shape[0]
         t = torch.randint(0, self.T, (b,), device=x0.device, generator=rng)
         noise = torch.randn_like(x0)
         xt = self.q_sample(x0, t, noise)
         pred = model(xt, t, cond)
-        return F.mse_loss(pred, noise)
+        loss = F.mse_loss(pred, noise)
+        return (loss, xt, pred, t, noise) if return_aux else loss
 
     def sample_ddim(self, model: nn.Module, cond: torch.Tensor,
                     shape: tuple[int, ...], steps: int = 50,
-                    eta: float = 0.0, clamp: bool = True,
-                    seed: int | None = None) -> torch.Tensor:
+                    eta: float = 0.0, clamp: tuple[float, float] | bool | None = (-1.0, 1.0),
+                    seed: int | None = None,
+                    x_init: torch.Tensor | None = None) -> torch.Tensor:
         """Deterministic (eta=0) DDIM sampling; steps in the DDPM grid."""
         if not 1 <= steps <= self.T:
             raise ValueError(f"steps must be in [1, T={self.T}], got {steps}")
         device = next(model.parameters()).device
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
-        x = torch.randn(shape, device=device, generator=gen)
+        if x_init is None:
+            x = torch.randn(shape, device=device, generator=gen)
+        else:
+            if tuple(x_init.shape) != tuple(shape):
+                raise ValueError(f"x_init shape {tuple(x_init.shape)} != requested {shape}")
+            x = x_init.to(device=device).clone()
         # Use exactly `steps` model evaluations and include the final transition
         # from timestep 0 to clean x0 (alpha_bar_previous = 1).
         step_list = torch.linspace(self.T - 1, 0, steps, device="cpu").round().long().tolist()
@@ -91,13 +100,19 @@ class GaussianDiffusion:
             eps = model(x, torch.full((x.shape[0],), ti, device=device, dtype=torch.long), cond)
             x0 = (x - torch.sqrt(1.0 - ab_t)[None, None, None, None] * eps) / \
                  torch.sqrt(ab_t)[None, None, None, None]
-            if clamp:
-                x0 = x0.clamp(-1.0, 1.0)
+            clamp_range = (-1.0, 1.0) if clamp is True else clamp
+            if clamp_range is not None and clamp_range is not False:
+                x0 = x0.clamp(*clamp_range)
             sigma = eta * torch.sqrt((1.0 - ab_prev) / (1.0 - ab_t)) * \
                 torch.sqrt(1.0 - ab_t / ab_prev)
             x = torch.sqrt(ab_prev)[None, None, None, None] * x0 + \
                 torch.sqrt(1.0 - ab_prev - sigma ** 2)[None, None, None, None] * eps
-            if float(sigma) > 0.0:
+            # For eta > 0, all non-terminal transitions have positive sigma;
+            # the terminal sigma is exactly zero. Avoid reading this device
+            # scalar back to Python on every step (a CUDA synchronization).
+            # Adding zero times the final noise leaves the terminal result
+            # unchanged and consumes no randomness used by a later step.
+            if eta > 0.0:
                 x = x + sigma * torch.randn(x.shape, device=device, dtype=x.dtype,
                                              generator=gen)
         return x

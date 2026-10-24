@@ -1,6 +1,8 @@
 """Tests for the FEA-verified evaluation report (ROADMAP 4.6)."""
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -39,6 +41,13 @@ def test_reconstruction_metrics_known_values():
     assert m["E"]["mean_abs_rel_err"] == 0.5
     assert m["relative_density"]["mean_abs_rel_err"] == 0.0
     assert m["E"]["bias"] == -1.0
+
+
+def test_reconstruction_metrics_single_sample_uses_json_null_for_r2():
+    values = np.asarray([[1.0, 0.3, 0.25]])
+    metrics = ev.reconstruction_metrics(values, values, ev.COND_NAMES)
+    assert all(metrics[name]["r2"] is None for name in ev.COND_NAMES)
+    json.dumps(metrics, allow_nan=False)
 
 
 def test_reconstruction_metrics_rejects_shape_mismatch():
@@ -83,6 +92,30 @@ def test_run_evaluate_end_to_end(tmp_path):
     assert (out / "per_sample.csv").exists()
     assert (out / "parity.png").exists()
     assert (out / "relerr.png").exists()
+
+
+def test_single_sample_report_is_strict_json_with_null_r2(tmp_path):
+    samples = tmp_path / "samples"
+    samples.mkdir()
+    out = tmp_path / "out"
+    vol = _solid_cube(8)
+    rho = float(vol.mean())
+    np.save(samples / "one.npy", vol)
+    pd.DataFrame([{"file": "one.npy", "target_E": rho,
+                   "target_rho": rho, "target_nu": 0.3}]
+                 ).to_csv(samples / "samples_manifest.csv", index=False)
+    cfg = {"base_material": {"E": 1.0, "nu": 0.3},
+           "void_scale": 1.0e-6, "resolution": 8}
+    ev.run_evaluate(cfg, samples, out, no_filter=True,
+                    fea_fn=lambda voxels, res: _iso_c6(float(voxels.mean())))
+
+    def reject_nonstandard_constant(value):
+        raise ValueError(f"non-standard JSON constant {value}")
+
+    report = json.loads((out / "report.json").read_text(),
+                        parse_constant=reject_nonstandard_constant)
+    assert all(report["reconstruction"][name]["r2"] is None
+               for name in ev.COND_NAMES)
 
 
 def _iso_c6(rho: float, E_base: float = 1.0, nu: float = 0.3) -> np.ndarray:
@@ -135,3 +168,23 @@ def test_run_evaluate_fea_failure_excluded(tmp_path):
     assert report["fea_failures"] == 1
     assert report["total_samples"] == 1
     assert "reconstruction" not in report or report["reconstruction"] == {}
+
+
+def test_invalid_samples_are_filtered_before_fea(tmp_path):
+    samples = tmp_path / "samples"
+    samples.mkdir()
+    out = tmp_path / "out"
+    np.save(samples / "empty.npy", np.zeros((8, 8, 8), dtype=np.uint8))
+    pd.DataFrame([{"file": "empty.npy", "target_E": 0.3,
+                   "target_rho": 0.3, "target_nu": 0.3}]
+                 ).to_csv(samples / "samples_manifest.csv", index=False)
+
+    def should_not_run(*_args):
+        raise AssertionError("invalid sample reached FEA")
+
+    cfg = {"base_material": {"E": 1.0, "nu": 0.3},
+           "void_scale": 1.0e-6, "resolution": 8}
+    report = ev.run_evaluate(cfg, samples, out, no_filter=False, fea_fn=should_not_run)
+    assert report["fea_failures"] == 0
+    assert report["validity_rate"] == 0.0
+    assert pd.read_csv(out / "per_sample.csv").loc[0, "reason"] == "connectivity"
